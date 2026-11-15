@@ -58,7 +58,11 @@ You can safely expose the portal publicly while protecting your GitHub Actions q
 
 ## Cloud Deployment (Render / Railway / Docker)
 
-- **Render**: Connect this repository as a Web Service on Render (`render.yaml` is pre-configured). Set `GITHUB_TOKEN` and `GOOGLE_DRIVE_CREDENTIALS` (the same base64 service account string used in your GitHub Actions secrets), plus any optional protection vars above.
+- **One-Click Render Blueprint**: Open [`https://render.com/deploy?repo=https://github.com/ChukwumaKingsley/lichess-analytics-portal`](https://render.com/deploy?repo=https://github.com/ChukwumaKingsley/lichess-analytics-portal) (`render.yaml` is pre-configured with `/api/health`, Python 3.11, and all environment variables).
+  - Required secrets to paste into Render during setup:
+    1. `GOOGLE_DRIVE_CREDENTIALS`: The same base64-encoded service account JSON stored in your `lichess_report_preprocessor` GitHub Actions secrets.
+    2. `GITHUB_TOKEN`: A GitHub Personal Access Token (with `workflow` / Actions read+write access on `ChukwumaKingsley/lichess_report_preprocessor`).
+  - Optional protection variables: `PORTAL_USER_TOKENS`, `PORTAL_TRIGGER_PASSCODE`, `ALLOWED_TRIGGER_PLAYERS`, `PORTAL_VIEW_PASSCODE`.
 - **Docker**:
   ```bash
   docker build -t lichess-analytics-portal .
