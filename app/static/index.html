@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lichess Cloud Pipeline &amp; Real-Time Analytics Portal</title>
+  <meta name="description" content="Self-sustaining Lichess data pipeline controller and real-time analytics warehouse. Trigger GitHub Actions for any player, sync Google Drive CSV reports, and explore SSIS-equivalent chess analytics remotely." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@400;500;600;700&amp;family=Space+Grotesk:wght@600;700&amp;display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="portal-shell">
+    <!-- ==================== SIDEBAR: PIPELINE & DIRECTORY ==================== -->
+    <aside class="portal-sidebar" aria-label="Pipeline Control and Player Directory">
+      <div class="brand-header">
+        <div class="brand-mark" aria-hidden="true">&#9822;</div>
+        <div>
+          <div class="brand-title">Lichess Data Studio</div>
+          <div class="brand-subtitle">GitHub Actions &#8594; Drive &#8594; Live BI</div>
+        </div>
+      </div>
+
+      <!-- 1. Trigger GitHub Action Pipeline -->
+      <section class="sidebar-section" aria-labelledby="trigger-heading">
+        <div class="section-label" id="trigger-heading">
+          <span>Trigger Remote Pipeline</span>
+          <button type="button" id="auth-status-badge" class="auth-badge open" title="Pipeline access status">
+            Open · Rate-Limited
+          </button>
+        </div>
+        <div class="trigger-box">
+          <div class="input-row">
+            <input
+              type="text"
+              id="trigger-username-input"
+              class="input-text"
+              placeholder="Lichess username (e.g. Real_Vick)"
+              autocomplete="off"
+            />
+            <button type="button" id="btn-lookup-profile" class="btn btn-secondary" title="Check live Lichess profile">
+              Verify
+            </button>
+          </div>
+
+          <div id="allowed-players-hint" class="allowed-hint" style="display: none;"></div>
+
+          <!-- Inline Access Key Unlock Box (shown when trigger protection is active & locked) -->
+          <div id="trigger-unlock-box" class="unlock-box" style="display: none;">
+            <div style="font-size: 11px; color: var(--text-secondary);">
+              Protected mode: enter your trigger key to dispatch runs.
+            </div>
+            <div class="input-row">
+              <input
+                type="password"
+                id="trigger-access-key-input"
+                class="input-text"
+                placeholder="Access key / passcode"
+                autocomplete="current-password"
+              />
+              <button type="button" id="btn-unlock-trigger" class="btn btn-secondary">
+                Unlock
+              </button>
+            </div>
+          </div>
+
+          <!-- Live Lichess API Profile Preview -->
+          <div id="lichess-preview-card" class="lichess-preview-card">
+            <div class="preview-top">
+              <strong id="preview-username" style="font-family: var(--font-display);"></strong>
+              <a id="preview-profile-link" href="#" target="_blank" rel="noopener" class="external-link">Lichess &#8599;</a>
+            </div>
+            <div style="font-size: 11px; color: var(--text-secondary);" id="preview-total-games"></div>
+            <div id="preview-ratings-grid" class="preview-ratings-grid"></div>
+          </div>
+
+          <button type="button" id="btn-trigger-pipeline" class="btn btn-primary">
+            <span>&#9654; Run GitHub Action Pipeline</span>
+          </button>
+
+          <!-- Live Step-by-Step GitHub Action Tracker -->
+          <div id="active-run-stepper" class="run-stepper-card">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <strong id="stepper-title" style="font-size: 12px;">Pipeline Running...</strong>
+              <a id="stepper-gh-link" href="#" target="_blank" rel="noopener" class="external-link">Logs &#8599;</a>
+            </div>
+            <div id="stepper-steps" class="step-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Google Drive Player Warehouse Directory -->
+      <section class="sidebar-section" aria-labelledby="directory-heading">
+        <div class="section-label" id="directory-heading">
+          <span>Drive Player Reports</span>
+          <button type="button" id="btn-refresh-players" class="btn btn-ghost" title="Refresh Google Drive folders">
+            &#8635; Refresh
+          </button>
+        </div>
+        <div id="player-directory-list" class="player-list">
+          <!-- Populated dynamically -->
+        </div>
+      </section>
+
+      <!-- 3. Recent GitHub Action Runs -->
+      <section class="sidebar-section" aria-labelledby="runs-heading">
+        <div class="section-label" id="runs-heading">
+          <span>Recent Workflow Runs</span>
+          <button type="button" id="btn-refresh-runs" class="btn btn-ghost" title="Refresh GitHub Actions runs">
+            &#8635;
+          </button>
+        </div>
+        <div id="recent-runs-list" class="runs-list">
+          <!-- Populated dynamically -->
+        </div>
+      </section>
+    </aside>
+
+    <!-- ==================== MAIN ANALYTICS DASHBOARD ==================== -->
+    <main class="portal-main">
+      <!-- Top Header Bar -->
+      <header class="top-header-bar">
+        <div class="active-player-headline">
+          <h1>
+            <span id="dashboard-player-title">Wizard-King</span>
+            <a id="dashboard-lichess-link" href="https://lichess.org/@/Wizard-King" target="_blank" rel="noopener" class="external-link" style="font-size: 13px; font-weight: 500;">
+              lichess.org &#8599;
+            </a>
+          </h1>
+          <div class="pipeline-flow-meta">
+            <span class="flow-step-chip" id="chip-drive-sync">Drive CSV: Synced</span>
+            <span class="flow-step-chip" id="chip-ssis-mode">SSIS Split: Active (All / White / Black)</span>
+            <span class="flow-step-chip" id="chip-date-span">Span: --</span>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <button type="button" id="btn-sync-active-player" class="btn btn-secondary">
+            &#8635; Sync Player from Drive
+          </button>
+          <button type="button" id="btn-trigger-active-player" class="btn btn-primary">
+            &#9889; Trigger Fresh Lichess Pull
+          </button>
+          <button type="button" id="btn-export-csv" class="btn btn-secondary">
+            &#8681; Export Filtered CSV
+          </button>
+        </div>
+      </header>
+
+      <!-- Sync / Loading Status Banner -->
+      <div id="loading-banner" class="loading-banner" role="status">
+        <div class="spinner"></div>
+        <span id="loading-banner-text">Syncing player dataset from Google Drive...</span>
+      </div>
+
+      <!-- Interactive Slicers & SSIS Conditional Split Bar -->
+      <section class="filter-bar" aria-label="Dashboard Filters">
+        <div class="filter-group">
+          <div class="filter-item">
+            <span class="filter-label">SSIS Conditional Split (Piece Color)</span>
+            <div class="segmented-control" role="group" aria-label="Piece Color Filter">
+              <button type="button" class="seg-btn active" data-color="all" id="filter-color-all">
+                All Games
+              </button>
+              <button type="button" class="seg-btn" data-color="white" id="filter-color-white">
+                &#9812; White Table
+              </button>
+              <button type="button" class="seg-btn" data-color="black" id="filter-color-black">
+                &#9818; Black Table
+              </button>
+            </div>
+          </div>
+
+          <div class="filter-item">
+            <label class="filter-label" for="filter-speed">Time Control Category</label>
+            <select id="filter-speed" class="select-input">
+              <option value="all">All Speeds</option>
+              <option value="bullet">Bullet</option>
+              <option value="blitz">Blitz</option>
+              <option value="rapid">Rapid</option>
+              <option value="classical">Classical</option>
+              <option value="correspondence">Correspondence</option>
+            </select>
+          </div>
+
+          <div class="filter-item">
+            <label class="filter-label" for="filter-rated">Mode</label>
+            <select id="filter-rated" class="select-input">
+              <option value="all">Rated &amp; Casual</option>
+              <option value="true">Rated Only</option>
+              <option value="false">Casual Only</option>
+            </select>
+          </div>
+
+          <div class="filter-item">
+            <label class="filter-label" for="filter-source">Source</label>
+            <select id="filter-source" class="select-input">
+              <option value="all">All Sources</option>
+              <option value="pool">Pool / Matchmaking</option>
+              <option value="arena">Arena Tournament</option>
+              <option value="lobby">Lobby</option>
+              <option value="friend">Friend Challenge</option>
+              <option value="ai">Stockfish AI</option>
+            </select>
+          </div>
+
+          <div class="filter-item">
+            <label class="filter-label" for="filter-date-from">From Date</label>
+            <input type="date" id="filter-date-from" class="date-input" />
+          </div>
+
+          <div class="filter-item">
+            <label class="filter-label" for="filter-date-to">To Date</label>
+            <input type="date" id="filter-date-to" class="date-input" />
+          </div>
+        </div>
+
+        <div class="filter-group">
+          <div class="filter-item">
+            <label class="filter-label" for="filter-search">Opening / Opponent Search</label>
+            <input
+              type="text"
+              id="filter-search"
+              class="select-input"
+              placeholder="e.g. Caro-Kann, B18, opponent..."
+              style="min-width: 210px;"
+            />
+          </div>
+          <div class="filter-item" style="justify-content: flex-end; align-self: flex-end;">
+            <button type="button" id="btn-reset-filters" class="btn btn-ghost" style="height: 32px;">
+              Reset Filters
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Executive KPI Strip -->
+      <section class="kpi-grid" aria-label="Key Performance Indicators">
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Total Games</span>
+            <span id="kpi-rated-pct" class="mono-cell">--% rated</span>
+          </div>
+          <div class="kpi-value" id="kpi-total-games">--</div>
+          <div class="kpi-sub" id="kpi-tournament-sub">-- tournament games</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Win / Draw / Loss</span>
+            <span id="kpi-wdl-counts" class="mono-cell">--</span>
+          </div>
+          <div class="kpi-value" id="kpi-win-rate">--%</div>
+          <div class="wdl-bar" aria-hidden="true">
+            <div id="bar-win" class="wdl-win" style="width: 50%;"></div>
+            <div id="bar-draw" class="wdl-draw" style="width: 5%;"></div>
+            <div id="bar-loss" class="wdl-loss" style="width: 45%;"></div>
+          </div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Current &amp; Peak Rating</span>
+            <span id="kpi-peak-date" class="mono-cell">--</span>
+          </div>
+          <div class="kpi-value" id="kpi-current-rating">--</div>
+          <div class="kpi-sub" id="kpi-peak-rating">Peak: --</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Net Rating Delta</span>
+            <span class="mono-cell">&#931; ratingDiff</span>
+          </div>
+          <div class="kpi-value" id="kpi-net-diff">--</div>
+          <div class="kpi-sub" id="kpi-avg-rating">Avg Player Rating: --</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Avg Opponent Rating</span>
+            <span class="mono-cell">Strength of Schedule</span>
+          </div>
+          <div class="kpi-value" id="kpi-opp-rating">--</div>
+          <div class="kpi-sub" id="kpi-rating-edge">Rating Edge: --</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Avg Game Length</span>
+            <span class="mono-cell">Tempo</span>
+          </div>
+          <div class="kpi-value" id="kpi-avg-turns">-- turns</div>
+          <div class="kpi-sub" id="kpi-avg-moves">-- half-moves (ply)</div>
+        </div>
+      </section>
+
+      <!-- SSIS Conditional Split Comparison: White Games vs Black Games -->
+      <section class="split-comparison-grid" aria-label="White vs Black Conditional Split Comparison">
+        <div class="split-card">
+          <div class="split-card-header">
+            <span class="piece-chip white">&#9812; White Pieces Split (`played_as == "white"`)</span>
+            <span class="mono-cell" id="split-white-wdl" style="color: var(--text-secondary);">--</span>
+          </div>
+          <div class="wdl-bar">
+            <div id="split-white-bar-w" class="wdl-win" style="width: 50%;"></div>
+            <div id="split-white-bar-d" class="wdl-draw" style="width: 5%;"></div>
+            <div id="split-white-bar-l" class="wdl-loss" style="width: 45%;"></div>
+          </div>
+          <div class="split-metrics-row">
+            <div class="split-metric-cell">
+              <span>Games</span>
+              <strong id="split-white-games">--</strong>
+            </div>
+            <div class="split-metric-cell">
+              <span>Win Rate</span>
+              <strong id="split-white-winrate" style="color: var(--win-green);">--%</strong>
+            </div>
+            <div class="split-metric-cell">
+              <span>Net Rating &#916;</span>
+              <strong id="split-white-diff">--</strong>
+            </div>
+            <div class="split-metric-cell">
+              <span>Avg Turns</span>
+              <strong id="split-white-turns">--</strong>
+            </div>
+          </div>
+          <div style="font-size: 11.5px; color: var(--text-secondary);">
+            Most Played Opening: <strong id="split-white-opening" style="color: var(--text-primary);">--</strong>
+          </div>
+        </div>
+
+        <div class="split-card">
+          <div class="split-card-header">
+            <span class="piece-chip black">&#9818; Black Pieces Split (`played_as == "black"`)</span>
+            <span class="mono-cell" id="split-black-wdl" style="color: var(--text-secondary);">--</span>
+          </div>
+          <div class="wdl-bar">
+            <div id="split-black-bar-w" class="wdl-win" style="width: 48%;"></div>
+            <div id="split-black-bar-d" class="wdl-draw" style="width: 5%;"></div>
+            <div id="split-black-bar-l" class="wdl-loss" style="width: 47%;"></div>
+          </div>
+          <div class="split-metrics-row">
+            <div class="split-metric-cell">
+              <span>Games</span>
+              <strong id="split-black-games">--</strong>
+            </div>
+            <div class="split-metric-cell">
+              <span>Win Rate</span>
+              <strong id="split-black-winrate" style="color: var(--win-green);">--%</strong>
+            </div>
+            <div class="split-metric-cell">
+              <span>Net Rating &#916;</span>
+              <strong id="split-black-diff">--</strong>
+            </div>
+            <div class="split-metric-cell">
+              <span>Avg Turns</span>
+              <strong id="split-black-turns">--</strong>
+            </div>
+          </div>
+          <div style="font-size: 11.5px; color: var(--text-secondary);">
+            Most Played Opening: <strong id="split-black-opening" style="color: var(--text-primary);">--</strong>
+          </div>
+        </div>
+      </section>
+
+      <!-- Row 1 Charts: Rating History Progression + Game Termination Breakdown -->
+      <section class="charts-grid-2col">
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Rating History Progression</h2>
+              <div class="panel-subtitle">Historical Lichess rating curves across time control categories</div>
+            </div>
+            <div class="segmented-control" id="rating-cat-toggles">
+              <button type="button" class="seg-btn active" data-cat="main">Core Speeds</button>
+              <button type="button" class="seg-btn" data-cat="all">All Categories</button>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap">
+            <canvas id="chart-rating-history"></canvas>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Game Termination &amp; Outcome Matrix</h2>
+              <div class="panel-subtitle">How games conclude (`mate`, `resign`, `outoftime`, `draw`)</div>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap">
+            <canvas id="chart-status-breakdown"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Row 2 Charts: Monthly Volume & Win-Rate Evolution + Speed & Time Control Matrix -->
+      <section class="charts-grid-equal">
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Monthly Activity Volume &amp; Win-Rate Trend</h2>
+              <div class="panel-subtitle">Games played per month vs. rolling win percentage</div>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap sm">
+            <canvas id="chart-monthly-trends"></canvas>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Time-of-Day &amp; Day-of-Week Performance</h2>
+              <div class="panel-subtitle">Win rate and activity distribution by UTC hour of day</div>
+            </div>
+            <div class="segmented-control" id="activity-mode-toggles">
+              <button type="button" class="seg-btn active" data-mode="hour">By Hour (24h)</button>
+              <button type="button" class="seg-btn" data-mode="dow">By Day of Week</button>
+            </div>
+          </div>
+          <div class="chart-canvas-wrap sm">
+            <canvas id="chart-activity"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Row 3: Opening Repertoire Mastery + Speed & Time Control Breakdown -->
+      <section class="charts-grid-2col">
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Opening Repertoire Mastery (ECO Analytics)</h2>
+              <div class="panel-subtitle">Most frequent openings, Win/Draw/Loss split, and net rating impact</div>
+            </div>
+            <div class="segmented-control" id="opening-tab-toggles">
+              <button type="button" class="seg-btn active" data-side="overall">Overall</button>
+              <button type="button" class="seg-btn" data-side="white">As White</button>
+              <button type="button" class="seg-btn" data-side="black">As Black</button>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table" id="table-openings">
+              <thead>
+                <tr>
+                  <th>ECO</th>
+                  <th>Opening Variation</th>
+                  <th>Games</th>
+                  <th>W / D / L</th>
+                  <th>Win %</th>
+                  <th>Net &#916;</th>
+                  <th>Avg Turns</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Speeds &amp; Frequent Rivals</h2>
+              <div class="panel-subtitle">Performance by time control &amp; head-to-head opponent records</div>
+            </div>
+            <div class="segmented-control" id="secondary-table-toggles">
+              <button type="button" class="seg-btn active" data-view="speeds">By Speed &amp; Clock</button>
+              <button type="button" class="seg-btn" data-view="opponents">Top Opponents</button>
+            </div>
+          </div>
+          <div class="table-scroll" id="view-speeds-wrap">
+            <table class="data-table" id="table-speeds">
+              <thead>
+                <tr>
+                  <th>Speed / Clock</th>
+                  <th>Games</th>
+                  <th>Win %</th>
+                  <th>Peak / Cur</th>
+                  <th>Net &#916;</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="table-scroll" id="view-opponents-wrap" style="display: none;">
+            <table class="data-table" id="table-opponents">
+              <thead>
+                <tr>
+                  <th>Opponent</th>
+                  <th>Games</th>
+                  <th>Record (W-D-L)</th>
+                  <th>Win %</th>
+                  <th>Net &#916;</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Row 4: Paginated Real-Time Game Explorer -->
+      <section class="panel-card" aria-labelledby="gamelog-heading">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title" id="gamelog-heading">Warehouse Game Log Explorer</h2>
+            <div class="panel-subtitle" id="gamelog-subtitle">Inspect individual preprocessed games with direct Lichess board replay links</div>
+          </div>
+          <div class="pagination-bar">
+            <button type="button" id="btn-prev-page" class="btn btn-secondary">&#8592; Prev</button>
+            <span id="page-indicator" class="mono-cell" style="margin: 0 12px;">Page 1 of 1</span>
+            <button type="button" id="btn-next-page" class="btn btn-secondary">Next &#8594;</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table" id="table-games">
+            <thead>
+              <tr>
+                <th>Game ID</th>
+                <th>Timestamp (UTC)</th>
+                <th>Player</th>
+                <th>Side</th>
+                <th>Opponent</th>
+                <th>Speed / Clock</th>
+                <th>Result</th>
+                <th>Termination</th>
+                <th>Rating (&#916;)</th>
+                <th>Opening (ECO)</th>
+                <th>Turns</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="view-lock-overlay" class="view-lock-overlay" style="display: none;">
+    <div class="view-lock-card">
+      <div class="brand-mark" style="margin: 0 auto 10px;">&#9822;</div>
+      <h2 style="font-family: var(--font-display); font-size: 20px; margin-bottom: 6px;">Lichess Data Studio</h2>
+      <p style="font-size: 12.5px; color: var(--text-secondary); margin-bottom: 14px;">
+        This portal is protected. Enter your access key to view analytics and trigger pipelines.
+      </p>
+      <div class="input-row">
+        <input type="password" id="view-passcode-input" class="input-text" placeholder="Enter portal passcode" />
+        <button type="button" id="btn-unlock-view" class="btn btn-primary">Enter</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
