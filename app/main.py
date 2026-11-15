@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,12 +10,13 @@ from pydantic import BaseModel
 from app.config import DRIVE_PARENT_FOLDER_ID, GITHUB_REPO, GITHUB_WORKFLOW_FILE
 from app.drive_client import DriveClient
 from app.github_client import GitHubActionsClient
+from app.security import AccessGuard
 from app.warehouse import LichessWarehouse
 
 app = FastAPI(
     title="Lichess Cloud Pipeline & Analytics Portal",
     description="Self-sustaining web portal to trigger Lichess GitHub Actions pipelines, sync Google Drive CSV reports, and explore real-time SSIS-equivalent chess analytics.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -29,6 +30,7 @@ app.add_middleware(
 drive_client = DriveClient()
 github_client = GitHubActionsClient()
 warehouse = LichessWarehouse(drive_client=drive_client)
+access_guard = AccessGuard()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,6 +39,10 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 class TriggerPipelineRequest(BaseModel):
     username: str
+
+
+class AuthVerifyRequest(BaseModel):
+    token: str
 
 
 @app.get("/")
@@ -54,11 +60,39 @@ def health_check():
         "drive_folder_id": DRIVE_PARENT_FOLDER_ID,
         "github_repo": GITHUB_REPO,
         "github_workflow": GITHUB_WORKFLOW_FILE,
+        "trigger_protected": access_guard.is_trigger_protected(),
+        "view_protected": access_guard.is_view_protected(),
+    }
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    return access_guard.get_status(request)
+
+
+@app.post("/api/auth/verify")
+def auth_verify(req: AuthVerifyRequest):
+    token = req.token.strip()
+    trigger_user = access_guard.authenticate_trigger_token(token)
+    view_ok = access_guard.authenticate_view_token(token)
+
+    if access_guard.is_trigger_protected() and trigger_user is None and not view_ok:
+        raise HTTPException(status_code=401, detail="Invalid access key or passcode.")
+    if access_guard.is_view_protected() and not view_ok:
+        raise HTTPException(status_code=401, detail="Invalid access key or passcode.")
+
+    return {
+        "ok": True,
+        "authorized_user": trigger_user or ("viewer" if view_ok else "open"),
+        "trigger_authorized": (not access_guard.is_trigger_protected())
+        or (trigger_user is not None),
+        "view_authorized": view_ok,
     }
 
 
 @app.get("/api/players")
-def list_players(refresh: bool = Query(False)):
+def list_players(request: Request, refresh: bool = Query(False)):
+    access_guard.require_view_access(request)
     try:
         players = warehouse.discover_players(force_refresh=refresh)
         return {
@@ -71,7 +105,8 @@ def list_players(refresh: bool = Query(False)):
 
 
 @app.post("/api/sync/{username}")
-def sync_player_endpoint(username: str, force: bool = Query(True)):
+def sync_player_endpoint(request: Request, username: str, force: bool = Query(True)):
+    access_guard.require_view_access(request)
     try:
         if username == "__ALL__":
             players = warehouse.discover_players(force_refresh=True)
@@ -88,6 +123,7 @@ def sync_player_endpoint(username: str, force: bool = Query(True)):
 
 @app.get("/api/dashboard/{username}")
 def get_dashboard(
+    request: Request,
     username: str,
     color: str = Query("all"),
     speed: str = Query("all"),
@@ -100,6 +136,7 @@ def get_dashboard(
     page_size: int = Query(25, ge=5, le=100),
     force_sync: bool = Query(False),
 ):
+    access_guard.require_view_access(request)
     try:
         return warehouse.get_dashboard_data(
             username=username,
@@ -120,6 +157,7 @@ def get_dashboard(
 
 @app.get("/api/export/{username}")
 def export_csv(
+    request: Request,
     username: str,
     color: str = Query("all"),
     speed: str = Query("all"),
@@ -129,6 +167,7 @@ def export_csv(
     date_to: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
 ):
+    access_guard.require_view_access(request)
     try:
         csv_text = warehouse.export_filtered_csv(
             username=username,
@@ -152,10 +191,13 @@ def export_csv(
 
 
 @app.post("/api/pipeline/trigger")
-def trigger_pipeline(req: TriggerPipelineRequest):
+def trigger_pipeline(request: Request, req: TriggerPipelineRequest):
     username = req.username.strip()
     if not username:
         raise HTTPException(status_code=400, detail="Username cannot be empty.")
+
+    caller_label = access_guard.require_trigger_access(request, username)
+
     try:
         # Validate user exists on Lichess first so we don't waste a workflow run on a typo
         profile = github_client.fetch_lichess_user_profile(username)
@@ -167,13 +209,15 @@ def trigger_pipeline(req: TriggerPipelineRequest):
 
     try:
         res = github_client.trigger_workflow(canonical_username)
+        res["triggered_by"] = caller_label
         return res
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/pipeline/runs")
-def list_pipeline_runs(limit: int = Query(8, ge=1, le=25)):
+def list_pipeline_runs(request: Request, limit: int = Query(8, ge=1, le=25)):
+    access_guard.require_view_access(request)
     try:
         runs = github_client.list_runs(limit=limit)
         return {"runs": runs, "repo": GITHUB_REPO, "workflow": GITHUB_WORKFLOW_FILE}
@@ -182,7 +226,10 @@ def list_pipeline_runs(limit: int = Query(8, ge=1, le=25)):
 
 
 @app.get("/api/pipeline/runs/{run_id}")
-def get_pipeline_run_detail(run_id: int, auto_sync: bool = Query(True)):
+def get_pipeline_run_detail(
+    request: Request, run_id: int, auto_sync: bool = Query(True)
+):
+    access_guard.require_view_access(request)
     try:
         detail = github_client.get_run_detail(run_id)
         # If the run just finished with success and hasn't been synced yet, auto-sync Drive!
@@ -211,7 +258,8 @@ def get_pipeline_run_detail(run_id: int, auto_sync: bool = Query(True)):
 
 
 @app.get("/api/lichess/profile/{username}")
-def get_lichess_profile(username: str):
+def get_lichess_profile(request: Request, username: str):
+    access_guard.require_view_access(request)
     try:
         return github_client.fetch_lichess_user_profile(username)
     except ValueError as verr:

@@ -27,7 +27,9 @@
       <section class="sidebar-section" aria-labelledby="trigger-heading">
         <div class="section-label" id="trigger-heading">
           <span>Trigger Remote Pipeline</span>
-          <span style="color: var(--accent-amber);">workflow_dispatch</span>
+          <button type="button" id="auth-status-badge" class="auth-badge open" title="Pipeline access status">
+            Open · Rate-Limited
+          </button>
         </div>
         <div class="trigger-box">
           <div class="input-row">
@@ -35,12 +37,33 @@
               type="text"
               id="trigger-username-input"
               class="input-text"
-              placeholder="Lichess username (e.g. Wizard-King)"
+              placeholder="Lichess username (e.g. Real_Vick)"
               autocomplete="off"
             />
             <button type="button" id="btn-lookup-profile" class="btn btn-secondary" title="Check live Lichess profile">
               Verify
             </button>
+          </div>
+
+          <div id="allowed-players-hint" class="allowed-hint" style="display: none;"></div>
+
+          <!-- Inline Access Key Unlock Box (shown when trigger protection is active & locked) -->
+          <div id="trigger-unlock-box" class="unlock-box" style="display: none;">
+            <div style="font-size: 11px; color: var(--text-secondary);">
+              Protected mode: enter your trigger key to dispatch runs.
+            </div>
+            <div class="input-row">
+              <input
+                type="password"
+                id="trigger-access-key-input"
+                class="input-text"
+                placeholder="Access key / passcode"
+                autocomplete="current-password"
+              />
+              <button type="button" id="btn-unlock-trigger" class="btn btn-secondary">
+                Unlock
+              </button>
+            </div>
           </div>
 
           <!-- Live Lichess API Profile Preview -->
@@ -514,6 +537,20 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <div id="view-lock-overlay" class="view-lock-overlay" style="display: none;">
+    <div class="view-lock-card">
+      <div class="brand-mark" style="margin: 0 auto 10px;">&#9822;</div>
+      <h2 style="font-family: var(--font-display); font-size: 20px; margin-bottom: 6px;">Lichess Data Studio</h2>
+      <p style="font-size: 12.5px; color: var(--text-secondary); margin-bottom: 14px;">
+        This portal is protected. Enter your access key to view analytics and trigger pipelines.
+      </p>
+      <div class="input-row">
+        <input type="password" id="view-passcode-input" class="input-text" placeholder="Enter portal passcode" />
+        <button type="button" id="btn-unlock-view" class="btn btn-primary">Enter</button>
+      </div>
+    </div>
   </div>
 
   <div id="toast-container" class="toast-container" aria-live="polite"></div>

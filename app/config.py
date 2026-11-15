@@ -27,3 +27,22 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
 # Optional Lichess API token
 LICHESS_TOKEN = os.getenv("LICHESS_TOKEN")
+
+# ---------------------------------------------------------------------------
+# Public Deployment Protection & Access Control
+# ---------------------------------------------------------------------------
+# Optional passcode(s) required to trigger GitHub Actions (comma-separated)
+PORTAL_TRIGGER_PASSCODE = os.getenv("PORTAL_TRIGGER_PASSCODE", "").strip()
+
+# Optional per-user tokens in "alice:key1,bob:key2" format for subset access
+PORTAL_USER_TOKENS = os.getenv("PORTAL_USER_TOKENS", "").strip()
+
+# Optional passcode required to view dashboards at all
+PORTAL_VIEW_PASSCODE = os.getenv("PORTAL_VIEW_PASSCODE", "").strip()
+
+# Optional comma-separated Lichess usernames allowed to be triggered publicly
+ALLOWED_TRIGGER_PLAYERS = os.getenv("ALLOWED_TRIGGER_PLAYERS", "").strip()
+
+# Rate-limiting defaults to protect GitHub Actions quota
+TRIGGER_COOLDOWN_SECONDS = int(os.getenv("TRIGGER_COOLDOWN_SECONDS", "120"))
+TRIGGER_MAX_PER_HOUR = int(os.getenv("TRIGGER_MAX_PER_HOUR", "10"))

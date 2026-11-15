@@ -22,6 +22,8 @@ const state = {
   openingSideTab: "overall",    // "overall" | "white" | "black"
   secondaryTableView: "speeds", // "speeds" | "opponents"
   activeRunPollTimer: null,
+  authToken: sessionStorage.getItem("lichess_portal_token") || "",
+  authStatus: null,
   charts: {
     ratingHistory: null,
     statusBreakdown: null,
@@ -29,6 +31,22 @@ const state = {
     activity: null,
   },
 };
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (state.authToken) {
+    headers["X-Portal-Auth"] = state.authToken;
+  }
+  return headers;
+}
+
+async function apiFetch(url, options = {}) {
+  const opts = {
+    ...options,
+    headers: authHeaders(options.headers || {}),
+  };
+  return fetch(url, opts);
+}
 
 // Chart.js Global Typography & Theme Defaults
 Chart.defaults.color = "hsl(218, 12%, 70%)";
@@ -97,12 +115,80 @@ function setLoading(isLoading, message = "Loading player analytics...") {
 }
 
 /* ==========================================================================
-   API Calls & Data Sync
+   Auth & API Calls
    ========================================================================== */
+
+async function checkAuthStatus() {
+  try {
+    const res = await apiFetch("/api/auth/status");
+    if (!res.ok) return null;
+    const status = await res.json();
+    state.authStatus = status;
+
+    const badge = document.getElementById("auth-status-badge");
+    const unlockBox = document.getElementById("trigger-unlock-box");
+    const allowedHint = document.getElementById("allowed-players-hint");
+    const viewOverlay = document.getElementById("view-lock-overlay");
+
+    if (viewOverlay) {
+      viewOverlay.style.display =
+        status.view_protected && !status.view_authorized ? "grid" : "none";
+    }
+
+    if (badge) {
+      if (!status.trigger_protected) {
+        badge.className = "auth-badge open";
+        badge.textContent = `Open · ${status.max_triggers_per_hour}/hr`;
+      } else if (status.trigger_authorized) {
+        badge.className = "auth-badge open";
+        badge.textContent = `Unlocked · ${status.authorized_user}`;
+      } else {
+        badge.className = "auth-badge locked";
+        badge.textContent = "Locked · Key Needed";
+      }
+    }
+
+    if (unlockBox) {
+      unlockBox.style.display =
+        status.trigger_protected && !status.trigger_authorized ? "flex" : "none";
+    }
+
+    if (allowedHint) {
+      if (status.allowed_players && status.allowed_players.length > 0) {
+        allowedHint.style.display = "block";
+        allowedHint.textContent = `Allowed subset: ${status.allowed_players.join(", ")}`;
+      } else {
+        allowedHint.style.display = "none";
+      }
+    }
+
+    return status;
+  } catch (err) {
+    console.error("Auth status error:", err);
+    return null;
+  }
+}
+
+async function verifyPortalToken(token) {
+  const res = await fetch("/api/auth/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Invalid access key.");
+  }
+  const data = await res.json();
+  state.authToken = token;
+  sessionStorage.setItem("lichess_portal_token", token);
+  await checkAuthStatus();
+  return data;
+}
 
 async function loadPlayersDirectory(forceRefresh = false) {
   try {
-    const res = await fetch(`/api/players?refresh=${forceRefresh}`);
+    const res = await apiFetch(`/api/players?refresh=${forceRefresh}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.players = data.players || [];
@@ -189,7 +275,7 @@ async function fetchDashboardData(forceSync = false) {
     if (state.filters.date_to) params.set("date_to", state.filters.date_to);
     if (state.filters.search) params.set("search", state.filters.search);
 
-    const res = await fetch(
+    const res = await apiFetch(
       `/api/dashboard/${encodeURIComponent(uname)}?${params.toString()}`
     );
     if (!res.ok) {
@@ -764,7 +850,7 @@ async function lookupLichessProfile() {
   }
   const card = document.getElementById("lichess-preview-card");
   try {
-    const res = await fetch(`/api/lichess/profile/${encodeURIComponent(username)}`);
+    const res = await apiFetch(`/api/lichess/profile/${encodeURIComponent(username)}`);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || "Player not found on Lichess");
@@ -808,6 +894,14 @@ async function triggerGitHubPipeline(usernameOverride = null) {
     return;
   }
 
+  if (state.authStatus?.trigger_protected && !state.authStatus?.trigger_authorized) {
+    const unlockBox = document.getElementById("trigger-unlock-box");
+    if (unlockBox) unlockBox.style.display = "flex";
+    document.getElementById("trigger-access-key-input")?.focus();
+    showToast("Enter your trigger access key in the sidebar to dispatch runs.");
+    return;
+  }
+
   const btn = document.getElementById("btn-trigger-pipeline");
   const topBtn = document.getElementById("btn-trigger-active-player");
   if (btn) btn.disabled = true;
@@ -816,13 +910,16 @@ async function triggerGitHubPipeline(usernameOverride = null) {
   showToast(`Dispatching GitHub Action pipeline for '${username}'...`);
 
   try {
-    const res = await fetch("/api/pipeline/trigger", {
+    const res = await apiFetch("/api/pipeline/trigger", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        await checkAuthStatus();
+      }
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
     const payload = await res.json();
@@ -849,7 +946,7 @@ async function triggerGitHubPipeline(usernameOverride = null) {
 
 async function loadRecentRuns() {
   try {
-    const res = await fetch("/api/pipeline/runs?limit=6");
+    const res = await apiFetch("/api/pipeline/runs?limit=6");
     if (!res.ok) return [];
     const data = await res.json();
     const runs = data.runs || [];
@@ -909,7 +1006,7 @@ function startPollingRun(runId, username) {
 
   const pollOnce = async () => {
     try {
-      const res = await fetch(`/api/pipeline/runs/${runId}?auto_sync=true`);
+      const res = await apiFetch(`/api/pipeline/runs/${runId}?auto_sync=true`);
       if (!res.ok) return;
       const detail = await res.json();
       renderRunStepper(detail, username);
@@ -1174,14 +1271,63 @@ function bindEvents() {
     if (state.filters.date_from) params.set("date_from", state.filters.date_from);
     if (state.filters.date_to) params.set("date_to", state.filters.date_to);
     if (state.filters.search) params.set("search", state.filters.search);
+    if (state.authToken) params.set("token", state.authToken);
     window.location.href = `/api/export/${encodeURIComponent(
       state.activePlayer
     )}?${params.toString()}`;
   });
+  // Auth unlock handlers
+  document
+    .getElementById("btn-unlock-trigger")
+    ?.addEventListener("click", async () => {
+      const key = document.getElementById("trigger-access-key-input")?.value?.trim();
+      if (!key) return showToast("Enter an access key.");
+      try {
+        const res = await verifyPortalToken(key);
+        showToast(`Unlocked as ${res.authorized_user}`);
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+
+  document
+    .getElementById("btn-unlock-view")
+    ?.addEventListener("click", async () => {
+      const key = document.getElementById("view-passcode-input")?.value?.trim();
+      if (!key) return showToast("Enter the portal passcode.");
+      try {
+        await verifyPortalToken(key);
+        await Promise.all([
+          loadPlayersDirectory(false),
+          loadRecentRuns(),
+          fetchDashboardData(false),
+        ]);
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+
+  document
+    .getElementById("auth-status-badge")
+    ?.addEventListener("click", () => {
+      const unlockBox = document.getElementById("trigger-unlock-box");
+      if (unlockBox && state.authStatus?.trigger_protected) {
+        unlockBox.style.display =
+          unlockBox.style.display === "none" ? "flex" : "none";
+      } else {
+        showToast(
+          `Pipeline is open with rate limiting (${state.authStatus?.cooldown_seconds || 120}s cooldown, ${state.authStatus?.max_triggers_per_hour || 10}/hr).`
+        );
+      }
+    });
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
+  const auth = await checkAuthStatus();
+  if (auth && auth.view_protected && !auth.view_authorized) {
+    return;
+  }
   await Promise.all([
     loadPlayersDirectory(false),
     loadRecentRuns(),

@@ -17,3 +17,15 @@ services:
         sync: false
       - key: LICHESS_TOKEN
         sync: false
+      - key: PORTAL_TRIGGER_PASSCODE
+        sync: false
+      - key: PORTAL_USER_TOKENS
+        sync: false
+      - key: PORTAL_VIEW_PASSCODE
+        sync: false
+      - key: ALLOWED_TRIGGER_PLAYERS
+        sync: false
+      - key: TRIGGER_COOLDOWN_SECONDS
+        value: "120"
+      - key: TRIGGER_MAX_PER_HOUR
+        value: "10"

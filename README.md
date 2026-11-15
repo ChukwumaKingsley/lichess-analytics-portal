@@ -43,9 +43,22 @@ cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
+## Public Deployment Protection & Subset Access
+
+You can safely expose the portal publicly while protecting your GitHub Actions quota and Drive/Lichess tokens using environment variables:
+
+| Variable | Purpose | Example |
+| :--- | :--- | :--- |
+| `PORTAL_TRIGGER_PASSCODE` | Shared passcode required to trigger GitHub Actions (dashboards remain viewable) | `my-secret-pass` |
+| `PORTAL_USER_TOKENS` | Per-user revocable access keys (`label:key`) for a subset of trusted users | `kingsley:k-123,friend:f-456` |
+| `PORTAL_VIEW_PASSCODE` | Optional passcode to lock the entire dashboard behind a login overlay | `view-secret` |
+| `ALLOWED_TRIGGER_PLAYERS` | Restrict triggers to an allowlist of Lichess usernames (leave blank for any valid player) | `Wizard-King,Real_Vick` |
+| `TRIGGER_COOLDOWN_SECONDS` | Per-player cooldown between dispatches (default: `120`) | `120` |
+| `TRIGGER_MAX_PER_HOUR` | Max workflow triggers per IP per hour (default: `10`) | `10` |
+
 ## Cloud Deployment (Render / Railway / Docker)
 
-- **Render**: Connect this repository as a Web Service on Render (`render.yaml` is pre-configured). Set `GITHUB_TOKEN` and `GOOGLE_DRIVE_CREDENTIALS` (the same base64 service account string used in your GitHub Actions secrets).
+- **Render**: Connect this repository as a Web Service on Render (`render.yaml` is pre-configured). Set `GITHUB_TOKEN` and `GOOGLE_DRIVE_CREDENTIALS` (the same base64 service account string used in your GitHub Actions secrets), plus any optional protection vars above.
 - **Docker**:
   ```bash
   docker build -t lichess-analytics-portal .

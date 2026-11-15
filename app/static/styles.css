@@ -981,3 +981,74 @@ html, body {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+/* ==========================================================================
+   Access Control & Rate Limit UI
+   ========================================================================== */
+
+.auth-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface-2);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.auth-badge.open {
+  color: var(--win-green);
+  border-color: hsla(154, 64%, 46%, 0.35);
+  background: var(--win-green-soft);
+}
+
+.auth-badge.locked {
+  color: var(--accent-amber);
+  border-color: hsla(37, 86%, 56%, 0.35);
+  background: var(--accent-amber-soft);
+}
+
+.unlock-box {
+  background: var(--bg-canvas);
+  border: 1px solid hsla(37, 86%, 56%, 0.35);
+  border-radius: var(--radius-sm);
+  padding: 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.allowed-hint {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  background: var(--bg-canvas);
+  padding: 5px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border-subtle);
+}
+
+.view-lock-overlay {
+  position: fixed;
+  inset: 0;
+  background: hsla(220, 20%, 6%, 0.92);
+  backdrop-filter: blur(8px);
+  z-index: 9000;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.view-lock-card {
+  background: var(--bg-surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  padding: 28px;
+  max-width: 390px;
+  width: 100%;
+  text-align: center;
+  box-shadow: var(--shadow-modal);
+}
+

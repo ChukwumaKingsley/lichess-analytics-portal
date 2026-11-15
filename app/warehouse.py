@@ -318,7 +318,7 @@ class LichessWarehouse:
         )
         df["date_str"] = df["created_dt"].dt.strftime("%Y-%m-%d")
         df["month_str"] = df["created_dt"].dt.strftime("%Y-%m")
-        df["dow"] = df["created_dt"].dt.dayofweek  # 0=Mon .. 6=Sun
+        df["dow"] = df["created_dt"].dt.day_of_week  # 0=Mon .. 6=Sun
         df["hour"] = df["created_dt"].dt.hour
 
         df["opening_eco"] = df.get("opening_eco", pd.Series(dtype=str)).fillna("N/A")

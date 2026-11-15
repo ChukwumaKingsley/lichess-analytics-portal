@@ -7,3 +7,4 @@ data_cache/
 *.db
 *.sqlite3
 .DS_Store
+.pytest_cache/
