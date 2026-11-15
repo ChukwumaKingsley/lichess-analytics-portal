@@ -2,9 +2,13 @@ services:
   - type: web
     name: lichess-analytics-portal
     runtime: python
+    plan: free
+    healthCheckPath: /api/health
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
       - key: DRIVE_PARENT_FOLDER_ID
         value: 12PIh1S55cgjBMLpJ4G1cFJb-lAxHikqg
       - key: GITHUB_REPO
