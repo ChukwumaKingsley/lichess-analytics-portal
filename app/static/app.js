@@ -52,7 +52,7 @@ async function apiFetch(url, options = {}) {
 Chart.defaults.color = "hsl(218, 12%, 70%)";
 Chart.defaults.borderColor = "hsla(215, 16%, 80%, 0.08)";
 Chart.defaults.font.family = "'Plus Jakarta Sans', -apple-system, sans-serif";
-Chart.defaults.font.size = 11.5;
+Chart.defaults.font.size = 10.5;
 
 const CATEGORY_COLORS = {
   bullet: "hsl(37, 86%, 56%)",
@@ -701,13 +701,13 @@ function renderOpeningsTable(openingsObj) {
     tr.title = "Click to filter by this opening";
     tr.innerHTML = `
       <td><span class="eco-badge">${op.eco}</span></td>
-      <td style="color: var(--text-primary); font-weight: 500; max-width: 260px;">${op.name}</td>
+      <td class="opening-name-cell" title="${op.name}">${op.name}</td>
       <td class="mono-cell">${fmtInt(op.games)}</td>
-      <td class="mono-cell">${op.wins}W / ${op.draws}D / ${op.losses}L</td>
+      <td class="mono-cell">${op.wins}/${op.draws}/${op.losses}</td>
       <td>
-        <div style="display:flex; align-items:center; gap:8px;">
+        <div style="display:flex; align-items:center; gap:6px;">
           <span class="mono-cell" style="color: var(--text-primary); font-weight:600;">${op.win_rate}%</span>
-          <div class="wdl-bar" style="width: 64px;">
+          <div class="wdl-bar" style="width: 46px; flex-shrink:0;">
             <div class="wdl-win" style="width:${op.win_rate}%;"></div>
             <div class="wdl-draw" style="width:${op.draw_rate}%;"></div>
             <div class="wdl-loss" style="width:${op.loss_rate}%;"></div>
@@ -820,15 +820,15 @@ function renderGameLogTable(recentGames) {
       : "";
     tr.innerHTML = `
       <td><a href="${g.lichess_url}" target="_blank" rel="noopener" class="external-link">${g.game_id} &#8599;</a></td>
-      <td class="mono-cell">${g.created_at}</td>
-      <td style="font-weight: 600; color: var(--text-primary);">${g.player_name}</td>
+      <td class="mono-cell">${(g.created_at || "").slice(0, 16)}</td>
+      <td style="font-weight: 600; color: var(--text-primary); white-space:nowrap;">${g.player_name}</td>
       <td class="mono-cell">${sideBadge}</td>
-      <td>${g.opponent_name} <span class="mono-cell" style="color:var(--text-muted);">(${g.opponent_rating || "?"})</span></td>
+      <td style="white-space:nowrap;">${g.opponent_name} <span class="mono-cell" style="color:var(--text-muted);">(${g.opponent_rating || "?"})</span></td>
       <td class="mono-cell">${g.speed} · ${g.time_control}</td>
       <td><span class="result-pill ${g.result}">${g.result}</span></td>
       <td class="mono-cell">${g.status}</td>
       <td class="mono-cell">${g.player_rating || "--"} ${rDiff}</td>
-      <td style="max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${g.opening_name}">
+      <td style="max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${g.opening_name}">
         <span class="eco-badge">${g.opening_eco}</span> ${g.opening_name}
       </td>
       <td class="mono-cell">${g.turns || "--"}</td>
