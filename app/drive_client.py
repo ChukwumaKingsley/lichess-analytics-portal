@@ -26,8 +26,12 @@ class DriveClient:
 
     def _init_sdk_if_available(self) -> None:
         try:
-            if GOOGLE_DRIVE_CREDENTIALS_B64 and not GOOGLE_APPLICATION_CREDENTIALS:
-                creds_bytes = base64.b64decode(GOOGLE_DRIVE_CREDENTIALS_B64)
+            raw_creds = (GOOGLE_DRIVE_CREDENTIALS_B64 or "").strip()
+            if raw_creds and not GOOGLE_APPLICATION_CREDENTIALS:
+                if raw_creds.startswith("{"):
+                    creds_bytes = raw_creds.encode("utf-8")
+                else:
+                    creds_bytes = base64.b64decode(raw_creds)
                 tmp_creds = DATA_CACHE_DIR / ".service_account.json"
                 tmp_creds.write_bytes(creds_bytes)
                 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(tmp_creds)
