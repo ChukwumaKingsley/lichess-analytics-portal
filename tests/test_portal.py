@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import config
-from app.main import access_guard, app
+from app.main import access_guard, app, warehouse
 
 
 @pytest.fixture(autouse=True)
@@ -99,12 +99,16 @@ def test_view_passcode_protection(monkeypatch):
     r_unauth = client.get("/api/players")
     assert r_unauth.status_code == 401
 
+    r_cache_unauth = client.get("/api/cache/stats")
+    assert r_cache_unauth.status_code == 401
+
     r_verify = client.post("/api/auth/verify", json={"token": "secret-view-99"})
     assert r_verify.status_code == 200
     assert r_verify.json()["view_authorized"] is True
 
     r_auth = client.get("/api/players", headers={"X-Portal-Auth": "secret-view-99"})
     assert r_auth.status_code == 200
+    assert r_auth.headers.get("cache-control") == "private, max-age=180"
 
 
 def test_dashboard_and_ssis_conditional_split():
@@ -122,3 +126,60 @@ def test_dashboard_and_ssis_conditional_split():
     csv_resp = client.get("/api/export/Wizard-King?color=black&speed=rapid")
     assert csv_resp.status_code == 200
     assert "game_id,rated,speed" in csv_resp.text
+
+
+def test_multi_layer_caching_and_invalidation():
+    warehouse._invalidate_dashboard_cache("Wizard-King")
+
+    # First query computes from warehouse and populates _dashboard_cache
+    r1 = client.get("/api/dashboard/Wizard-King?color=all&speed=blitz")
+    assert r1.status_code == 200
+    assert r1.headers.get("cache-control") == "public, max-age=180"
+    assert r1.json()["cache_info"]["source"] in ("warehouse_compute", "drive_sync")
+
+    # Second identical query hits server memory_cache
+    r2 = client.get("/api/dashboard/Wizard-King?color=all&speed=blitz")
+    assert r2.status_code == 200
+    assert r2.json()["cache_info"]["source"] == "memory_cache"
+
+    # Cache telemetry endpoint reports cached player and queries
+    stats_resp = client.get("/api/cache/stats")
+    assert stats_resp.status_code == 200
+    stats = stats_resp.json()
+    assert stats["cached_players_in_memory"] >= 1
+    assert stats["cached_dashboard_queries"] >= 1
+    assert "drive_calls_made" in stats
+    assert "drive_calls_saved" in stats
+
+    # Non-forced sync on fresh local player skips Drive metadata calls and invalidates query cache
+    with patch.object(
+        warehouse.drive, "get_player_files_metadata"
+    ) as mock_meta:
+        warehouse.sync_player("Wizard-King", force=False)
+        mock_meta.assert_not_called()
+
+    # Next query recomputes cleanly after invalidation
+    r3 = client.get("/api/dashboard/Wizard-King?color=all&speed=blitz")
+    assert r3.status_code == 200
+    assert r3.json()["cache_info"]["source"] == "warehouse_compute"
+
+
+def test_multipage_frontend_assets():
+    idx = client.get("/")
+    assert idx.status_code == 200
+    assert 'data-page="overview"' in idx.text
+    assert 'data-page="ratings"' in idx.text
+    assert 'data-page="openings"' in idx.text
+    assert 'data-page="timing"' in idx.text
+    assert 'data-page="games"' in idx.text
+    assert 'data-page="pipeline"' in idx.text
+
+    css = client.get("/static/styles.css")
+    assert css.status_code == 200
+    assert ".report-page.active" in css.text
+
+    js = client.get("/static/app.js")
+    assert js.status_code == 200
+    assert "navigateTo" in js.text
+    assert "reportCache" in js.text
+

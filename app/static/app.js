@@ -1,8 +1,22 @@
 /* ==========================================================================
-   Lichess Cloud Pipeline & Real-Time Analytics Portal — Frontend Controller
+   Lichess Data Studio — Multi-Page Dimensional Analytics & Cache Controller
    ========================================================================== */
 
+const CLIENT_REPORT_TTL_MS = 180 * 1000; // 3 min client memory cache
+const SESSION_LIST_TTL_MS = 180 * 1000;  // 3 min sessionStorage cache for Drive players
+const SESSION_RUNS_TTL_MS = 45 * 1000;   // 45s sessionStorage cache for workflow runs
+
+const VALID_PAGES = new Set([
+  "overview",
+  "ratings",
+  "openings",
+  "timing",
+  "games",
+  "pipeline",
+]);
+
 const state = {
+  activePage: "overview",
   activePlayer: "Wizard-King",
   players: [],
   filters: {
@@ -17,18 +31,21 @@ const state = {
     page_size: 20,
   },
   dashboardData: null,
+  lastCacheLabel: "Client Cache",
+  reportCache: new Map(), // key -> { ts, data }
+  cacheStats: null,
   ratingCategoryFilter: "main", // "main" | "all"
-  activityMode: "hour",         // "hour" | "dow"
   openingSideTab: "overall",    // "overall" | "white" | "black"
-  secondaryTableView: "speeds", // "speeds" | "opponents"
   activeRunPollTimer: null,
   authToken: sessionStorage.getItem("lichess_portal_token") || "",
   authStatus: null,
   charts: {
+    overviewRating: null,
     ratingHistory: null,
-    statusBreakdown: null,
     monthlyTrends: null,
-    activity: null,
+    activityHour: null,
+    activityDow: null,
+    statusBreakdown: null,
   },
 };
 
@@ -68,8 +85,17 @@ const CATEGORY_COLORS = {
 };
 
 /* ==========================================================================
-   Utility Helpers
+   Utility & Cache Helpers
    ========================================================================== */
+
+function escapeHtml(val) {
+  return String(val ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function fmtInt(n) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return "--";
@@ -107,15 +133,144 @@ function setLoading(isLoading, message = "Loading player analytics...") {
   const textEl = document.getElementById("loading-banner-text");
   if (!banner || !textEl) return;
   textEl.textContent = message;
-  if (isLoading) {
-    banner.classList.add("active");
+  banner.classList.toggle("active", Boolean(isLoading));
+}
+
+function getReportCacheKey(username, filters) {
+  return `${String(username || "").toLowerCase()}|${JSON.stringify(filters)}`;
+}
+
+function invalidateClientReportCache(username = null) {
+  if (!username) {
+    state.reportCache.clear();
+    return;
+  }
+  const target = username.toLowerCase();
+  for (const key of state.reportCache.keys()) {
+    if (key.startsWith(`${target}|`) || key.startsWith("__all__|")) {
+      state.reportCache.delete(key);
+    }
+  }
+}
+
+function getSessionCache(key, ttlMs) {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.ts !== "number") return null;
+    if (Date.now() - parsed.ts > ttlMs) {
+      sessionStorage.removeItem(key);
+      return null;
+    }
+    return parsed.data;
+  } catch {
+    return null;
+  }
+}
+
+function setSessionCache(key, data) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ ts: Date.now(), data }));
+  } catch {
+    // Ignore storage quota errors cleanly
+  }
+}
+
+function updateCacheStatusChip(source) {
+  const chip = document.getElementById("chip-cache-status");
+  if (!chip) return;
+  chip.classList.remove("sync");
+  if (source === "client_cache") {
+    chip.textContent = "Cache: Client Memory (0ms)";
+  } else if (source === "memory_cache") {
+    chip.textContent = "Cache: Server Memory";
+  } else if (source === "drive_sync") {
+    chip.textContent = "Cache: Drive Synced";
+    chip.classList.add("sync");
+  } else if (source === "warehouse_compute") {
+    chip.textContent = "Cache: Warehouse Built";
   } else {
-    banner.classList.remove("active");
+    chip.textContent = "Cache: Ready";
+  }
+}
+
+function renderCacheTelemetry(stats) {
+  if (!stats) return;
+  state.cacheStats = stats;
+  const memEl = document.getElementById("cache-mem-players");
+  const repEl = document.getElementById("cache-report-queries");
+  const madeEl = document.getElementById("cache-drive-made");
+  const savedEl = document.getElementById("cache-drive-saved");
+  if (memEl) memEl.textContent = fmtInt(stats.cached_players_in_memory);
+  if (repEl) {
+    repEl.textContent = `${fmtInt(stats.cached_dashboard_queries)} srv / ${fmtInt(
+      state.reportCache.size
+    )} cli`;
+  }
+  if (madeEl) madeEl.textContent = fmtInt(stats.drive_calls_made);
+  if (savedEl) savedEl.textContent = fmtInt(stats.drive_calls_saved);
+}
+
+async function refreshCacheTelemetry() {
+  try {
+    const res = await apiFetch("/api/cache/stats");
+    if (!res.ok) return;
+    const stats = await res.json();
+    renderCacheTelemetry(stats);
+  } catch (err) {
+    console.error("Failed to load cache stats:", err);
   }
 }
 
 /* ==========================================================================
-   Auth & API Calls
+   Multi-Page Hash Navigation
+   ========================================================================== */
+
+function getPageFromHash() {
+  const raw = (window.location.hash || "").replace(/^#\/?/, "").trim().toLowerCase();
+  return VALID_PAGES.has(raw) ? raw : "overview";
+}
+
+function navigateTo(page, updateHash = true) {
+  const targetPage = VALID_PAGES.has(page) ? page : "overview";
+  state.activePage = targetPage;
+
+  if (updateHash) {
+    const desiredHash = `#/${targetPage}`;
+    if (window.location.hash !== desiredHash) {
+      window.location.hash = desiredHash;
+    }
+  }
+
+  document.querySelectorAll("#page-nav-list .nav-item").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.nav === targetPage);
+  });
+
+  document.querySelectorAll(".report-page").forEach((section) => {
+    section.classList.toggle("active", section.dataset.page === targetPage);
+  });
+
+  const filterBar = document.getElementById("global-filter-bar");
+  if (filterBar) {
+    filterBar.style.display = targetPage === "pipeline" ? "none" : "flex";
+  }
+
+  if (targetPage === "pipeline") {
+    const triggerInput = document.getElementById("trigger-username-input");
+    if (triggerInput && !triggerInput.value.trim() && state.activePlayer !== "__ALL__") {
+      triggerInput.value = state.activePlayer;
+    }
+    refreshCacheTelemetry();
+  }
+
+  requestAnimationFrame(() => {
+    renderActivePage();
+  });
+}
+
+/* ==========================================================================
+   Auth & Directory API Calls
    ========================================================================== */
 
 async function checkAuthStatus() {
@@ -188,11 +343,31 @@ async function verifyPortalToken(token) {
 
 async function loadPlayersDirectory(forceRefresh = false) {
   try {
+    if (!forceRefresh) {
+      const cached = getSessionCache("lichess_players_cache", SESSION_LIST_TTL_MS);
+      if (cached && Array.isArray(cached.players)) {
+        state.players = cached.players;
+        if (cached.cache_stats) renderCacheTelemetry(cached.cache_stats);
+        renderPlayerDirectory();
+        return;
+      }
+    }
+
     const res = await apiFetch(`/api/players?refresh=${forceRefresh}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.players = data.players || [];
+    setSessionCache("lichess_players_cache", {
+      players: state.players,
+      cache_stats: data.cache_stats || null,
+    });
+    if (data.cache_stats) {
+      renderCacheTelemetry(data.cache_stats);
+    }
     renderPlayerDirectory();
+    if (forceRefresh) {
+      showToast(`Refreshed ${state.players.length} Drive player folders.`);
+    }
   } catch (err) {
     console.error("Failed to load players:", err);
   }
@@ -203,7 +378,6 @@ function renderPlayerDirectory() {
   if (!container) return;
   container.innerHTML = "";
 
-  // Add Unified Warehouse Option (Mirrors SSIS Looping Through files.dtsx)
   const allBtn = document.createElement("button");
   allBtn.type = "button";
   allBtn.className = `player-item ${state.activePlayer === "__ALL__" ? "active" : ""}`;
@@ -224,12 +398,12 @@ function renderPlayerDirectory() {
     btn.className = `player-item ${
       state.activePlayer.toLowerCase() === p.username.toLowerCase() ? "active" : ""
     }`;
-    const initials = p.username.slice(0, 2).toUpperCase();
+    const initials = escapeHtml(p.username.slice(0, 2).toUpperCase());
     const badgeText = p.total_games > 0 ? `${fmtInt(p.total_games)}` : "Drive";
     btn.innerHTML = `
       <div class="player-item-left">
         <div class="player-avatar">${initials}</div>
-        <div class="player-name-text">${p.username}</div>
+        <div class="player-name-text">${escapeHtml(p.username)}</div>
       </div>
       <span class="player-badge">${badgeText}</span>
     `;
@@ -249,15 +423,29 @@ async function selectPlayer(username, forceSync = false) {
   }
 
   await fetchDashboardData(forceSync);
-  loadPlayersDirectory(false);
 }
 
 async function fetchDashboardData(forceSync = false) {
   const uname = state.activePlayer;
+  const cacheKey = getReportCacheKey(uname, state.filters);
+
+  if (forceSync) {
+    invalidateClientReportCache(uname);
+    sessionStorage.removeItem("lichess_players_cache");
+  } else {
+    const hit = state.reportCache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < CLIENT_REPORT_TTL_MS) {
+      state.dashboardData = hit.data;
+      renderHeaderMeta(hit.data, "client_cache");
+      renderActivePage();
+      return;
+    }
+  }
+
   setLoading(
     true,
     forceSync
-      ? `Downloading latest CSV reports for ${uname} from Google Drive...`
+      ? `Syncing latest CSV reports for ${uname} from Google Drive...`
       : `Loading warehouse analytics for ${uname === "__ALL__" ? "All Synced Players" : uname}...`
   );
 
@@ -284,7 +472,17 @@ async function fetchDashboardData(forceSync = false) {
     }
     const data = await res.json();
     state.dashboardData = data;
-    renderDashboard(data);
+    state.reportCache.set(cacheKey, { ts: Date.now(), data });
+
+    const cacheSource = data.cache_info?.source || (forceSync ? "drive_sync" : "warehouse_compute");
+    renderHeaderMeta(data, cacheSource);
+    renderActivePage();
+
+    if (forceSync) {
+      await loadPlayersDirectory(true);
+    } else if (state.activePage === "pipeline") {
+      refreshCacheTelemetry();
+    }
   } catch (err) {
     showToast(`Error loading dashboard: ${err.message}`);
   } finally {
@@ -293,14 +491,17 @@ async function fetchDashboardData(forceSync = false) {
 }
 
 /* ==========================================================================
-   Dashboard Rendering
+   Header & Dimensional Page Renderers
    ========================================================================== */
 
-function renderDashboard(data) {
+function renderHeaderMeta(data, cacheSource) {
+  updateCacheStatusChip(cacheSource);
+
   if (!data || data.empty) {
     document.getElementById("dashboard-player-title").textContent =
       data?.username || state.activePlayer;
-    document.getElementById("kpi-total-games").textContent = "0";
+    document.getElementById("chip-drive-sync").textContent = "Warehouse Rows: 0";
+    document.getElementById("chip-date-span").textContent = "Range: --";
     return;
   }
 
@@ -312,14 +513,15 @@ function renderDashboard(data) {
 
   document.getElementById("dashboard-player-title").textContent = displayTitle;
   const lichessLink = document.getElementById("dashboard-lichess-link");
-  if (isAll) {
-    lichessLink.style.display = "none";
-  } else {
-    lichessLink.style.display = "inline";
-    lichessLink.href = `https://lichess.org/@/${encodeURIComponent(data.username)}`;
+  if (lichessLink) {
+    if (isAll) {
+      lichessLink.style.display = "none";
+    } else {
+      lichessLink.style.display = "inline";
+      lichessLink.href = `https://lichess.org/@/${encodeURIComponent(data.username)}`;
+    }
   }
 
-  // Metadata Chips
   document.getElementById("chip-drive-sync").textContent = `Warehouse Rows: ${fmtInt(
     s.unfiltered_total_games
   )} (${fmtInt(s.white_games)} W / ${fmtInt(s.black_games)} B)`;
@@ -331,8 +533,45 @@ function renderDashboard(data) {
     s.first_game_date && s.last_game_date
       ? `Range: ${s.first_game_date} → ${s.last_game_date}`
       : "Range: --";
+}
 
-  // 1. KPI Strip
+function renderActivePage() {
+  const data = state.dashboardData;
+  if (!data) return;
+
+  if (data.empty && state.activePage !== "pipeline") {
+    const kpiGames = document.getElementById("kpi-total-games");
+    if (kpiGames) kpiGames.textContent = "0";
+    return;
+  }
+
+  switch (state.activePage) {
+    case "overview":
+      renderOverviewPage(data);
+      break;
+    case "ratings":
+      renderRatingsPage(data);
+      break;
+    case "openings":
+      renderOpeningsPage(data);
+      break;
+    case "timing":
+      renderTimingPage(data);
+      break;
+    case "games":
+      renderGameLogTable(data.recent_games);
+      break;
+    case "pipeline":
+      renderCacheTelemetry(state.cacheStats);
+      break;
+    default:
+      renderOverviewPage(data);
+  }
+}
+
+/* --- Page 1: Overview & Color Split --- */
+function renderOverviewPage(data) {
+  const s = data.summary;
   const ratedPct =
     s.games > 0 ? Math.round((s.rated_games * 100.0) / s.games) : 0;
   document.getElementById("kpi-rated-pct").textContent = `${ratedPct}% rated`;
@@ -384,23 +623,9 @@ function renderDashboard(data) {
     ? `${s.avg_moves} half-moves (ply)`
     : "--";
 
-  // 2. SSIS White vs Black Split Cards
   renderColorSplitCards(data.color_split);
-
-  // 3. Charts
-  renderRatingHistoryChart(data.rating_history);
-  renderStatusBreakdownChart(data.status_breakdown);
-  renderMonthlyTrendsChart(data.monthly_trends);
-  renderActivityChart(data.activity);
-
-  // 4. Tables
-  renderOpeningsTable(data.openings);
-  renderSpeedsAndOpponentsTables(
-    data.speed_breakdown,
-    data.time_controls,
-    data.opponents
-  );
-  renderGameLogTable(data.recent_games);
+  renderOverviewRatingChart(data.rating_history);
+  renderOverviewOpeningsSnapshot(data.openings?.overall || []);
 }
 
 function renderColorSplitCards(split) {
@@ -420,8 +645,7 @@ function renderColorSplitCards(split) {
   wdEl.textContent = fmtDiff(w.net_rating_diff);
   wdEl.className = diffClass(w.net_rating_diff);
   document.getElementById("split-white-turns").textContent = w.avg_turns || "--";
-  document.getElementById("split-white-opening").textContent =
-    w.top_opening || "N/A";
+  document.getElementById("split-white-opening").textContent = w.top_opening || "N/A";
 
   document.getElementById("split-black-wdl").textContent = `${fmtInt(
     b.wins
@@ -435,13 +659,112 @@ function renderColorSplitCards(split) {
   bdEl.textContent = fmtDiff(b.net_rating_diff);
   bdEl.className = diffClass(b.net_rating_diff);
   document.getElementById("split-black-turns").textContent = b.avg_turns || "--";
-  document.getElementById("split-black-opening").textContent =
-    b.top_opening || "N/A";
+  document.getElementById("split-black-opening").textContent = b.top_opening || "N/A";
 }
 
-/* ==========================================================================
-   Chart.js Visualizations
-   ========================================================================== */
+function renderOverviewRatingChart(rh) {
+  const ctx = document.getElementById("chart-overview-rating");
+  if (!ctx) return;
+  if (state.charts.overviewRating) {
+    state.charts.overviewRating.destroy();
+  }
+
+  const dates = rh?.dates || [];
+  const seriesObj = rh?.series || {};
+  const coreCats = ["bullet", "blitz", "rapid", "classical"];
+
+  const datasets = [];
+  Object.keys(seriesObj).forEach((cat) => {
+    if (!coreCats.includes(cat.toLowerCase())) return;
+    const color = CATEGORY_COLORS[cat] || "hsl(215, 30%, 65%)";
+    datasets.push({
+      label: cat.charAt(0).toUpperCase() + cat.slice(1),
+      data: seriesObj[cat],
+      borderColor: color,
+      backgroundColor: color,
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 3,
+      tension: 0.2,
+      spanGaps: true,
+    });
+  });
+
+  state.charts.overviewRating = new Chart(ctx, {
+    type: "line",
+    data: { labels: dates, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: {
+          position: "top",
+          labels: { boxWidth: 10, usePointStyle: true },
+        },
+      },
+      scales: {
+        x: { ticks: { maxTicksLimit: 7 }, grid: { display: false } },
+        y: { ticks: { precision: 0 } },
+      },
+    },
+  });
+}
+
+function renderOverviewOpeningsSnapshot(rows) {
+  const tbody = document.querySelector("#table-overview-openings tbody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  const top5 = (rows || []).slice(0, 5);
+  if (top5.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; padding:16px;">No opening records</td></tr>`;
+    return;
+  }
+  top5.forEach((op) => {
+    const tr = document.createElement("tr");
+    tr.style.cursor = "pointer";
+    tr.innerHTML = `
+      <td><span class="eco-badge">${escapeHtml(op.eco)}</span></td>
+      <td class="opening-name-cell" title="${escapeHtml(op.name)}">${escapeHtml(op.short_name || op.name)}</td>
+      <td class="mono-cell">${fmtInt(op.games)}</td>
+      <td class="mono-cell" style="color: var(--win-green); font-weight:600;">${op.win_rate}%</td>
+    `;
+    tr.addEventListener("click", () => {
+      applySearchFilter(op.eco !== "N/A" ? op.eco : op.short_name);
+      navigateTo("openings");
+    });
+    tbody.appendChild(tr);
+  });
+}
+
+/* --- Page 2: Ratings & Trends --- */
+function renderRatingsPage(data) {
+  renderRatingCategoryPills(data.rating_history?.latest_by_category || {});
+  renderRatingHistoryChart(data.rating_history);
+  renderMonthlyTrendsChart(data.monthly_trends);
+  renderSpeedsTable(data.speed_breakdown, data.time_controls);
+}
+
+function renderRatingCategoryPills(latestMap) {
+  const wrap = document.getElementById("rating-category-pills");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  const entries = Object.entries(latestMap || {});
+  if (entries.length === 0) return;
+
+  entries.forEach(([cat, stats]) => {
+    const color = CATEGORY_COLORS[cat] || "hsl(215, 30%, 65%)";
+    const pill = document.createElement("div");
+    pill.className = "cat-pill";
+    pill.innerHTML = `
+      <span class="cat-pill-dot" style="background:${color};"></span>
+      <span class="cat-pill-name">${escapeHtml(cat)}</span>
+      <span class="cat-pill-val">${fmtInt(stats.current)}</span>
+      <span class="cat-pill-peak">(Peak ${fmtInt(stats.peak)})</span>
+    `;
+    wrap.appendChild(pill);
+  });
+}
 
 function renderRatingHistoryChart(rh) {
   const ctx = document.getElementById("chart-rating-history");
@@ -491,62 +814,12 @@ function renderRatingHistoryChart(rh) {
       },
       scales: {
         x: {
-          ticks: { maxTicksLimit: 8 },
+          ticks: { maxTicksLimit: 10 },
           grid: { display: false },
         },
         y: {
           ticks: { precision: 0 },
         },
-      },
-    },
-  });
-}
-
-function renderStatusBreakdownChart(statusList) {
-  const ctx = document.getElementById("chart-status-breakdown");
-  if (!ctx) return;
-  if (state.charts.statusBreakdown) {
-    state.charts.statusBreakdown.destroy();
-  }
-
-  const topItems = (statusList || []).slice(0, 6);
-  const labels = topItems.map((i) => i.status.toUpperCase());
-
-  state.charts.statusBreakdown = new Chart(ctx, {
-    type: "bar",
-    data: {
-      labels,
-      datasets: [
-        {
-          label: "Wins",
-          data: topItems.map((i) => i.wins),
-          backgroundColor: "hsl(154, 64%, 46%)",
-          borderRadius: 4,
-        },
-        {
-          label: "Draws",
-          data: topItems.map((i) => i.draws),
-          backgroundColor: "hsl(215, 16%, 62%)",
-          borderRadius: 4,
-        },
-        {
-          label: "Losses",
-          data: topItems.map((i) => i.losses),
-          backgroundColor: "hsl(4, 76%, 58%)",
-          borderRadius: 4,
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      indexAxis: "y",
-      plugins: {
-        legend: { position: "top", labels: { boxWidth: 10 } },
-      },
-      scales: {
-        x: { stacked: true },
-        y: { stacked: true, grid: { display: false } },
       },
     },
   });
@@ -559,7 +832,7 @@ function renderMonthlyTrendsChart(monthlyList) {
     state.charts.monthlyTrends.destroy();
   }
 
-  const items = (monthlyList || []).slice(-36); // Last 36 active months for clean view
+  const items = (monthlyList || []).slice(-36);
   const labels = items.map((m) => m.month);
 
   state.charts.monthlyTrends = new Chart(ctx, {
@@ -617,72 +890,102 @@ function renderMonthlyTrendsChart(monthlyList) {
   });
 }
 
-function renderActivityChart(activity) {
-  const ctx = document.getElementById("chart-activity");
-  if (!ctx) return;
-  if (state.charts.activity) {
-    state.charts.activity.destroy();
+function renderSpeedsTable(speeds, timeControls) {
+  const speedsBody = document.querySelector("#table-speeds tbody");
+  if (!speedsBody) return;
+  speedsBody.innerHTML = "";
+
+  if ((!speeds || speeds.length === 0) && (!timeControls || timeControls.length === 0)) {
+    speedsBody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:16px;">No speed data</td></tr>`;
+    return;
   }
 
-  const isHour = state.activityMode === "hour";
-  const rows = isHour
-    ? activity?.by_hour || []
-    : activity?.by_day_of_week || [];
-  const labels = rows.map((r) => (isHour ? r.hour : r.day));
+  (speeds || []).forEach((sp) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="color: var(--text-primary); font-weight: 600; text-transform: capitalize;">${escapeHtml(sp.speed)}</td>
+      <td class="mono-cell">${fmtInt(sp.games)}</td>
+      <td class="mono-cell" style="color: var(--win-green);">${sp.win_rate}%</td>
+      <td class="mono-cell">${sp.peak_rating || "--"} / ${sp.current_rating || "--"}</td>
+      <td class="${diffClass(sp.net_rating_diff)}">${fmtDiff(sp.net_rating_diff)}</td>
+    `;
+    speedsBody.appendChild(tr);
+  });
 
-  state.charts.activity = new Chart(ctx, {
-    type: "bar",
-    data: {
-      labels,
-      datasets: [
-        {
-          type: "line",
-          label: "Win Rate (%)",
-          data: rows.map((r) => r.win_rate),
-          borderColor: "hsl(154, 64%, 46%)",
-          backgroundColor: "hsl(154, 64%, 46%)",
-          borderWidth: 2,
-          pointRadius: 2,
-          yAxisID: "y1",
-          tension: 0.25,
-        },
-        {
-          type: "bar",
-          label: "Games",
-          data: rows.map((r) => r.games),
-          backgroundColor: "hsla(37, 86%, 56%, 0.35)",
-          borderColor: "hsl(37, 86%, 56%)",
-          borderWidth: 1,
-          borderRadius: 3,
-          yAxisID: "y",
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: "index", intersect: false },
-      plugins: {
-        legend: { position: "top", labels: { boxWidth: 10 } },
-      },
-      scales: {
-        x: { grid: { display: false } },
-        y: { position: "left", title: { display: true, text: "Games" } },
-        y1: {
-          position: "right",
-          min: 0,
-          max: 100,
-          grid: { drawOnChartArea: false },
-          title: { display: true, text: "Win %" },
-        },
-      },
-    },
+  (timeControls || []).slice(0, 6).forEach((tc) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="mono-cell" style="color: var(--text-secondary);">Clock ${escapeHtml(tc.time_control)}</td>
+      <td class="mono-cell">${fmtInt(tc.games)}</td>
+      <td class="mono-cell">${tc.win_rate}%</td>
+      <td class="mono-cell">${tc.peak_rating || "--"}</td>
+      <td class="${diffClass(tc.net_rating_diff)}">${fmtDiff(tc.net_rating_diff)}</td>
+    `;
+    speedsBody.appendChild(tr);
   });
 }
 
-/* ==========================================================================
-   Tables Rendering
-   ========================================================================== */
+/* --- Page 3: Openings (ECO) --- */
+function renderOpeningsPage(data) {
+  renderOpeningHighlights(data.openings);
+  renderOpeningsTable(data.openings);
+}
+
+function renderOpeningHighlights(openingsObj) {
+  const rows =
+    (openingsObj && openingsObj[state.openingSideTab]) ||
+    openingsObj?.overall ||
+    [];
+
+  const setCard = (prefix, eco, name, sub) => {
+    const ecoEl = document.getElementById(`op-highlight-${prefix}-eco`);
+    const nameEl = document.getElementById(`op-highlight-${prefix}-name`);
+    const subEl = document.getElementById(`op-highlight-${prefix}-sub`);
+    if (ecoEl) ecoEl.textContent = eco || "--";
+    if (nameEl) {
+      nameEl.textContent = name || "--";
+      nameEl.title = name || "";
+    }
+    if (subEl) subEl.textContent = sub || "--";
+  };
+
+  if (rows.length === 0) {
+    setCard("most", "--", "No openings", "--");
+    setCard("best", "--", "No openings", "--");
+    setCard("gain", "--", "No openings", "--");
+    return;
+  }
+
+  const most = rows[0];
+  setCard(
+    "most",
+    most.eco,
+    most.short_name || most.name,
+    `${fmtInt(most.games)} games · ${most.win_rate}% win rate`
+  );
+
+  const eligibleBest = rows.filter((r) => r.games >= 5);
+  const bestPool = eligibleBest.length > 0 ? eligibleBest : rows;
+  const best = [...bestPool].sort(
+    (a, b) => b.win_rate - a.win_rate || b.games - a.games
+  )[0];
+  setCard(
+    "best",
+    best.eco,
+    best.short_name || best.name,
+    `${best.win_rate}% win across ${fmtInt(best.games)} games`
+  );
+
+  const gainer = [...rows].sort(
+    (a, b) => (b.net_rating_diff || 0) - (a.net_rating_diff || 0)
+  )[0];
+  setCard(
+    "gain",
+    gainer.eco,
+    gainer.short_name || gainer.name,
+    `${fmtDiff(gainer.net_rating_diff)} rating pts (${fmtInt(gainer.games)} games)`
+  );
+}
 
 function renderOpeningsTable(openingsObj) {
   const tbody = document.querySelector("#table-openings tbody");
@@ -698,10 +1001,10 @@ function renderOpeningsTable(openingsObj) {
   rows.forEach((op) => {
     const tr = document.createElement("tr");
     tr.style.cursor = "pointer";
-    tr.title = "Click to filter by this opening";
+    tr.title = "Click to filter games by this opening";
     tr.innerHTML = `
-      <td><span class="eco-badge">${op.eco}</span></td>
-      <td class="opening-name-cell" title="${op.name}">${op.name}</td>
+      <td><span class="eco-badge">${escapeHtml(op.eco)}</span></td>
+      <td class="opening-name-cell" title="${escapeHtml(op.name)}">${escapeHtml(op.name)}</td>
       <td class="mono-cell">${fmtInt(op.games)}</td>
       <td class="mono-cell">${op.wins}/${op.draws}/${op.losses}</td>
       <td>
@@ -718,79 +1021,173 @@ function renderOpeningsTable(openingsObj) {
       <td class="mono-cell">${op.avg_turns || "--"}</td>
     `;
     tr.addEventListener("click", () => {
-      const searchEl = document.getElementById("filter-search");
-      if (searchEl) {
-        searchEl.value = op.eco !== "N/A" ? op.eco : op.short_name;
-        state.filters.search = searchEl.value;
-        state.filters.page = 1;
-        fetchDashboardData(false);
-      }
+      const term = op.eco !== "N/A" ? op.eco : op.short_name;
+      applySearchFilter(term);
+      showToast(`Filtered repertoire by ${term}`);
     });
     tbody.appendChild(tr);
   });
 }
 
-function renderSpeedsAndOpponentsTables(speeds, timeControls, opponents) {
-  const speedsBody = document.querySelector("#table-speeds tbody");
-  if (speedsBody) {
-    speedsBody.innerHTML = "";
-    (speeds || []).forEach((sp) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td style="color: var(--text-primary); font-weight: 600; text-transform: capitalize;">${sp.speed}</td>
-        <td class="mono-cell">${fmtInt(sp.games)}</td>
-        <td class="mono-cell" style="color: var(--win-green);">${sp.win_rate}%</td>
-        <td class="mono-cell">${sp.peak_rating || "--"} / ${sp.current_rating || "--"}</td>
-        <td class="${diffClass(sp.net_rating_diff)}">${fmtDiff(sp.net_rating_diff)}</td>
-      `;
-      speedsBody.appendChild(tr);
-    });
-
-    (timeControls || []).slice(0, 5).forEach((tc) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono-cell" style="color: var(--text-secondary);">Clock ${tc.time_control}</td>
-        <td class="mono-cell">${fmtInt(tc.games)}</td>
-        <td class="mono-cell">${tc.win_rate}%</td>
-        <td class="mono-cell">${tc.peak_rating || "--"}</td>
-        <td class="${diffClass(tc.net_rating_diff)}">${fmtDiff(tc.net_rating_diff)}</td>
-      `;
-      speedsBody.appendChild(tr);
-    });
-  }
-
-  const oppBody = document.querySelector("#table-opponents tbody");
-  if (oppBody) {
-    oppBody.innerHTML = "";
-    if (!opponents || opponents.length === 0) {
-      oppBody.innerHTML = `<tr><td colspan="5" style="text-align:center;">No opponent data</td></tr>`;
-    } else {
-      opponents.forEach((o) => {
-        const tr = document.createElement("tr");
-        tr.style.cursor = "pointer";
-        tr.title = "Click to filter games against this opponent";
-        tr.innerHTML = `
-          <td style="color: var(--text-primary); font-weight: 600;">${o.opponent}</td>
-          <td class="mono-cell">${fmtInt(o.games)}</td>
-          <td class="mono-cell">${o.wins}W - ${o.draws}D - ${o.losses}L</td>
-          <td class="mono-cell">${o.win_rate}%</td>
-          <td class="${diffClass(o.net_rating_diff)}">${fmtDiff(o.net_rating_diff)}</td>
-        `;
-        tr.addEventListener("click", () => {
-          const searchEl = document.getElementById("filter-search");
-          if (searchEl) {
-            searchEl.value = o.opponent;
-            state.filters.search = o.opponent;
-            state.filters.page = 1;
-            fetchDashboardData(false);
-          }
-        });
-        oppBody.appendChild(tr);
-      });
-    }
-  }
+/* --- Page 4: Timing, Terminations & Rivals --- */
+function renderTimingPage(data) {
+  renderActivityBarChart(
+    "chart-activity-hour",
+    "activityHour",
+    data.activity?.by_hour || [],
+    "hour",
+    "hsl(37, 86%, 56%)"
+  );
+  renderActivityBarChart(
+    "chart-activity-dow",
+    "activityDow",
+    data.activity?.by_day_of_week || [],
+    "day",
+    "hsl(204, 80%, 58%)"
+  );
+  renderStatusBreakdownChart(data.status_breakdown);
+  renderOpponentsTable(data.opponents);
 }
 
+function renderActivityBarChart(canvasId, chartKey, rows, labelKey, barHue) {
+  const ctx = document.getElementById(canvasId);
+  if (!ctx) return;
+  if (state.charts[chartKey]) {
+    state.charts[chartKey].destroy();
+  }
+
+  const labels = (rows || []).map((r) => r[labelKey]);
+  const barSoft = barHue.replace("hsl(", "hsla(").replace(")", ", 0.35)");
+
+  state.charts[chartKey] = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          type: "line",
+          label: "Win Rate (%)",
+          data: (rows || []).map((r) => r.win_rate),
+          borderColor: "hsl(154, 64%, 46%)",
+          backgroundColor: "hsl(154, 64%, 46%)",
+          borderWidth: 2,
+          pointRadius: 2,
+          yAxisID: "y1",
+          tension: 0.25,
+        },
+        {
+          type: "bar",
+          label: "Games",
+          data: (rows || []).map((r) => r.games),
+          backgroundColor: barSoft,
+          borderColor: barHue,
+          borderWidth: 1,
+          borderRadius: 3,
+          yAxisID: "y",
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "top", labels: { boxWidth: 10 } },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { maxTicksLimit: 12 } },
+        y: { position: "left", title: { display: true, text: "Games" } },
+        y1: {
+          position: "right",
+          min: 0,
+          max: 100,
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: "Win %" },
+        },
+      },
+    },
+  });
+}
+
+function renderStatusBreakdownChart(statusList) {
+  const ctx = document.getElementById("chart-status-breakdown");
+  if (!ctx) return;
+  if (state.charts.statusBreakdown) {
+    state.charts.statusBreakdown.destroy();
+  }
+
+  const topItems = (statusList || []).slice(0, 7);
+  const labels = topItems.map((i) => i.status.toUpperCase());
+
+  state.charts.statusBreakdown = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Wins",
+          data: topItems.map((i) => i.wins),
+          backgroundColor: "hsl(154, 64%, 46%)",
+          borderRadius: 4,
+        },
+        {
+          label: "Draws",
+          data: topItems.map((i) => i.draws),
+          backgroundColor: "hsl(215, 16%, 62%)",
+          borderRadius: 4,
+        },
+        {
+          label: "Losses",
+          data: topItems.map((i) => i.losses),
+          backgroundColor: "hsl(4, 76%, 58%)",
+          borderRadius: 4,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      indexAxis: "y",
+      plugins: {
+        legend: { position: "top", labels: { boxWidth: 10 } },
+      },
+      scales: {
+        x: { stacked: true },
+        y: { stacked: true, grid: { display: false } },
+      },
+    },
+  });
+}
+
+function renderOpponentsTable(opponents) {
+  const oppBody = document.querySelector("#table-opponents tbody");
+  if (!oppBody) return;
+  oppBody.innerHTML = "";
+  if (!opponents || opponents.length === 0) {
+    oppBody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding: 16px;">No opponent data</td></tr>`;
+    return;
+  }
+
+  opponents.forEach((o) => {
+    const tr = document.createElement("tr");
+    tr.style.cursor = "pointer";
+    tr.title = "Click to filter head-to-head games";
+    tr.innerHTML = `
+      <td style="color: var(--text-primary); font-weight: 600;">${escapeHtml(o.opponent)}</td>
+      <td class="mono-cell">${fmtInt(o.games)}</td>
+      <td class="mono-cell">${o.wins}W - ${o.draws}D - ${o.losses}L</td>
+      <td class="mono-cell">${o.win_rate}%</td>
+      <td class="${diffClass(o.net_rating_diff)}">${fmtDiff(o.net_rating_diff)}</td>
+    `;
+    tr.addEventListener("click", () => {
+      applySearchFilter(o.opponent);
+      showToast(`Filtered head-to-head games vs ${o.opponent}`);
+    });
+    oppBody.appendChild(tr);
+  });
+}
+
+/* --- Page 5: Game Log Explorer --- */
 function renderGameLogTable(recentGames) {
   const tbody = document.querySelector("#table-games tbody");
   if (!tbody || !recentGames) return;
@@ -819,17 +1216,17 @@ function renderGameLogTable(recentGames) {
         )})</span>`
       : "";
     tr.innerHTML = `
-      <td><a href="${g.lichess_url}" target="_blank" rel="noopener" class="external-link">${g.game_id} &#8599;</a></td>
-      <td class="mono-cell">${(g.created_at || "").slice(0, 16)}</td>
-      <td style="font-weight: 600; color: var(--text-primary); white-space:nowrap;">${g.player_name}</td>
+      <td><a href="${escapeHtml(g.lichess_url)}" target="_blank" rel="noopener" class="external-link">${escapeHtml(g.game_id)} &#8599;</a></td>
+      <td class="mono-cell">${escapeHtml((g.created_at || "").slice(0, 16))}</td>
+      <td style="font-weight: 600; color: var(--text-primary); white-space:nowrap;">${escapeHtml(g.player_name)}</td>
       <td class="mono-cell">${sideBadge}</td>
-      <td style="white-space:nowrap;">${g.opponent_name} <span class="mono-cell" style="color:var(--text-muted);">(${g.opponent_rating || "?"})</span></td>
-      <td class="mono-cell">${g.speed} · ${g.time_control}</td>
-      <td><span class="result-pill ${g.result}">${g.result}</span></td>
-      <td class="mono-cell">${g.status}</td>
+      <td style="white-space:nowrap;">${escapeHtml(g.opponent_name)} <span class="mono-cell" style="color:var(--text-muted);">(${g.opponent_rating || "?"})</span></td>
+      <td class="mono-cell">${escapeHtml(g.speed)} · ${escapeHtml(g.time_control)}</td>
+      <td><span class="result-pill ${escapeHtml(g.result)}">${escapeHtml(g.result)}</span></td>
+      <td class="mono-cell">${escapeHtml(g.status)}</td>
       <td class="mono-cell">${g.player_rating || "--"} ${rDiff}</td>
-      <td style="max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${g.opening_name}">
-        <span class="eco-badge">${g.opening_eco}</span> ${g.opening_name}
+      <td style="max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(g.opening_name)}">
+        <span class="eco-badge">${escapeHtml(g.opening_eco)}</span> ${escapeHtml(g.opening_name)}
       </td>
       <td class="mono-cell">${g.turns || "--"}</td>
     `;
@@ -837,9 +1234,24 @@ function renderGameLogTable(recentGames) {
   });
 }
 
+function applySearchFilter(term) {
+  const searchEl = document.getElementById("filter-search");
+  if (searchEl) searchEl.value = term || "";
+  state.filters.search = term || "";
+  state.filters.page = 1;
+  fetchDashboardData(false);
+}
+
 /* ==========================================================================
-   GitHub Actions Pipeline Controller & Live Stepper
+   Page 6: GitHub Actions Pipeline Controller & Live Stepper
    ========================================================================== */
+
+function setPipelineDotActive(isActive) {
+  const dot = document.getElementById("nav-pipeline-dot");
+  if (dot) {
+    dot.style.display = isActive ? "inline-block" : "none";
+  }
+}
 
 async function lookupLichessProfile() {
   const input = document.getElementById("trigger-username-input");
@@ -870,7 +1282,7 @@ async function lookupLichessProfile() {
       if (prof.ratings && prof.ratings[cat]) {
         const pill = document.createElement("div");
         pill.className = "preview-rating-pill";
-        pill.innerHTML = `<span>${cat}</span><strong>${prof.ratings[cat].rating}</strong>`;
+        pill.innerHTML = `<span>${escapeHtml(cat)}</span><strong>${prof.ratings[cat].rating}</strong>`;
         grid.appendChild(pill);
       }
     });
@@ -898,14 +1310,12 @@ async function triggerGitHubPipeline(usernameOverride = null) {
     const unlockBox = document.getElementById("trigger-unlock-box");
     if (unlockBox) unlockBox.style.display = "flex";
     document.getElementById("trigger-access-key-input")?.focus();
-    showToast("Enter your trigger access key in the sidebar to dispatch runs.");
+    showToast("Enter your trigger access key to dispatch runs.");
     return;
   }
 
   const btn = document.getElementById("btn-trigger-pipeline");
-  const topBtn = document.getElementById("btn-trigger-active-player");
   if (btn) btn.disabled = true;
-  if (topBtn) topBtn.disabled = true;
 
   showToast(`Dispatching GitHub Action pipeline for '${username}'...`);
 
@@ -924,13 +1334,13 @@ async function triggerGitHubPipeline(usernameOverride = null) {
     }
     const payload = await res.json();
     showToast(`GitHub Action started for ${payload.username}! Tracking live progress...`);
-    await loadRecentRuns();
+    sessionStorage.removeItem("lichess_runs_cache");
+    await loadRecentRuns(true);
     if (payload.run && payload.run.id) {
       startPollingRun(payload.run.id, payload.username);
     } else {
-      // Poll recent runs to attach to the new run ID
       setTimeout(async () => {
-        const runs = await loadRecentRuns();
+        const runs = await loadRecentRuns(true);
         if (runs && runs.length > 0) {
           startPollingRun(runs[0].id, payload.username);
         }
@@ -940,17 +1350,33 @@ async function triggerGitHubPipeline(usernameOverride = null) {
     showToast(`Pipeline trigger error: ${err.message}`);
   } finally {
     if (btn) btn.disabled = false;
-    if (topBtn) topBtn.disabled = false;
   }
 }
 
-async function loadRecentRuns() {
+async function loadRecentRuns(forceRefresh = false) {
   try {
+    if (!forceRefresh) {
+      const cached = getSessionCache("lichess_runs_cache", SESSION_RUNS_TTL_MS);
+      if (Array.isArray(cached)) {
+        renderRecentRunsList(cached);
+        setPipelineDotActive(
+          Boolean(state.activeRunPollTimer) ||
+            cached.some((r) => r.status === "in_progress" || r.status === "queued")
+        );
+        return cached;
+      }
+    }
+
     const res = await apiFetch("/api/pipeline/runs?limit=6");
     if (!res.ok) return [];
     const data = await res.json();
     const runs = data.runs || [];
+    setSessionCache("lichess_runs_cache", runs);
     renderRecentRunsList(runs);
+    setPipelineDotActive(
+      Boolean(state.activeRunPollTimer) ||
+        runs.some((r) => r.status === "in_progress" || r.status === "queued")
+    );
     return runs;
   } catch (err) {
     console.error("Failed to load runs:", err);
@@ -963,6 +1389,11 @@ function renderRecentRunsList(runs) {
   if (!container) return;
   container.innerHTML = "";
 
+  if (!runs || runs.length === 0) {
+    container.innerHTML = `<div style="font-size:11px; color:var(--text-muted); padding:8px;">No recent workflow runs found.</div>`;
+    return;
+  }
+
   runs.forEach((r) => {
     const row = document.createElement("div");
     row.className = "run-row";
@@ -971,7 +1402,7 @@ function renderRecentRunsList(runs) {
     else if (r.status === "completed") {
       dotClass = r.conclusion === "success" ? "dot-success" : "dot-failed";
     }
-    const labelUser = r.username ? ` · ${r.username}` : "";
+    const labelUser = r.username ? ` · ${escapeHtml(r.username)}` : "";
     const timeStr = r.createdAt
       ? new Date(r.createdAt).toLocaleTimeString([], {
           hour: "2-digit",
@@ -987,7 +1418,7 @@ function renderRecentRunsList(runs) {
         </span>
       </div>
       <span class="mono-cell" style="color:var(--text-muted); font-size:11px;">
-        ${r.status === "completed" ? r.conclusion : r.status} · ${timeStr}
+        ${escapeHtml(r.status === "completed" ? r.conclusion : r.status)} · ${escapeHtml(timeStr)}
       </span>
     `;
     row.addEventListener("click", () => {
@@ -1001,8 +1432,9 @@ function startPollingRun(runId, username) {
   if (state.activeRunPollTimer) {
     clearInterval(state.activeRunPollTimer);
   }
+  setPipelineDotActive(true);
   const stepperCard = document.getElementById("active-run-stepper");
-  stepperCard.classList.add("visible");
+  stepperCard?.classList.add("visible");
 
   const pollOnce = async () => {
     try {
@@ -1014,11 +1446,15 @@ function startPollingRun(runId, username) {
       if (detail.status === "completed") {
         clearInterval(state.activeRunPollTimer);
         state.activeRunPollTimer = null;
-        await loadRecentRuns();
-        await loadPlayersDirectory(true);
+        setPipelineDotActive(false);
+
+        sessionStorage.removeItem("lichess_runs_cache");
+        sessionStorage.removeItem("lichess_players_cache");
+        await loadRecentRuns(true);
 
         const targetPlayer = detail.username || username;
         if (detail.conclusion === "success") {
+          invalidateClientReportCache(targetPlayer);
           showToast(
             `Pipeline completed! Synced fresh Google Drive data${
               targetPlayer ? ` for ${targetPlayer}` : ""
@@ -1029,6 +1465,7 @@ function startPollingRun(runId, username) {
           } else {
             await fetchDashboardData(true);
           }
+          await refreshCacheTelemetry();
         } else {
           showToast(`Workflow run #${runId} finished with: ${detail.conclusion}`);
         }
@@ -1046,12 +1483,13 @@ function renderRunStepper(detail, fallbackUser) {
   const titleEl = document.getElementById("stepper-title");
   const linkEl = document.getElementById("stepper-gh-link");
   const stepsEl = document.getElementById("stepper-steps");
-  const uname = detail.username || fallbackUser || "";
+  if (!titleEl || !stepsEl) return;
 
+  const uname = detail.username || fallbackUser || "";
   titleEl.textContent = `Run #${String(detail.id).slice(-5)}${
     uname ? ` (${uname})` : ""
   } — ${detail.status === "completed" ? detail.conclusion : detail.status}`;
-  if (detail.url) linkEl.href = detail.url;
+  if (detail.url && linkEl) linkEl.href = detail.url;
 
   stepsEl.innerHTML = "";
   const jobs = detail.jobs || [];
@@ -1065,10 +1503,10 @@ function renderRunStepper(detail, fallbackUser) {
     const div = document.createElement("div");
     div.className = "step-item";
     div.innerHTML = `
-      <span><span class="step-status-dot ${dotClass}"></span>${st.name}</span>
-      <span class="mono-cell" style="color:var(--text-muted); font-size:10.5px;">${
+      <span><span class="step-status-dot ${dotClass}"></span>${escapeHtml(st.name)}</span>
+      <span class="mono-cell" style="color:var(--text-muted); font-size:10.5px;">${escapeHtml(
         st.status === "completed" ? st.conclusion : st.status
-      }</span>
+      )}</span>
     `;
     stepsEl.appendChild(div);
   });
@@ -1079,6 +1517,33 @@ function renderRunStepper(detail, fallbackUser) {
    ========================================================================== */
 
 function bindEvents() {
+  // Multi-page sidebar navigation
+  document.querySelectorAll("#page-nav-list .nav-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      navigateTo(btn.dataset.nav);
+    });
+  });
+
+  // In-page jump shortcuts
+  document.querySelectorAll(".jump-nav-btn[data-jump]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      navigateTo(btn.dataset.jump);
+    });
+  });
+
+  // Header "Trigger Lichess Pull" shortcut -> Pipeline page
+  document.getElementById("btn-goto-pipeline")?.addEventListener("click", () => {
+    const triggerInput = document.getElementById("trigger-username-input");
+    if (triggerInput && state.activePlayer !== "__ALL__") {
+      triggerInput.value = state.activePlayer;
+    }
+    navigateTo("pipeline");
+  });
+
+  window.addEventListener("hashchange", () => {
+    navigateTo(getPageFromHash(), false);
+  });
+
   // Piece Color Segmented Control (SSIS Conditional Split)
   document.querySelectorAll("[data-color]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1171,22 +1636,6 @@ function bindEvents() {
       });
     });
 
-  // Activity Mode Toggles (Hour vs Day of Week)
-  document
-    .querySelectorAll("#activity-mode-toggles .seg-btn")
-    .forEach((btn) => {
-      btn.addEventListener("click", () => {
-        document
-          .querySelectorAll("#activity-mode-toggles .seg-btn")
-          .forEach((b) => b.classList.remove("active"));
-        btn.classList.add("active");
-        state.activityMode = btn.dataset.mode;
-        if (state.dashboardData) {
-          renderActivityChart(state.dashboardData.activity);
-        }
-      });
-    });
-
   // Opening Side Toggles
   document
     .querySelectorAll("#opening-tab-toggles .seg-btn")
@@ -1198,25 +1647,8 @@ function bindEvents() {
         btn.classList.add("active");
         state.openingSideTab = btn.dataset.side;
         if (state.dashboardData) {
-          renderOpeningsTable(state.dashboardData.openings);
+          renderOpeningsPage(state.dashboardData);
         }
-      });
-    });
-
-  // Secondary Table View Toggles (Speeds vs Opponents)
-  document
-    .querySelectorAll("#secondary-table-toggles .seg-btn")
-    .forEach((btn) => {
-      btn.addEventListener("click", () => {
-        document
-          .querySelectorAll("#secondary-table-toggles .seg-btn")
-          .forEach((b) => b.classList.remove("active"));
-        btn.classList.add("active");
-        const view = btn.dataset.view;
-        document.getElementById("view-speeds-wrap").style.display =
-          view === "speeds" ? "block" : "none";
-        document.getElementById("view-opponents-wrap").style.display =
-          view === "opponents" ? "block" : "none";
       });
     });
 
@@ -1232,22 +1664,13 @@ function bindEvents() {
     fetchDashboardData(false);
   });
 
-  // Sidebar & Header Actions
+  // Pipeline & Drive Refresh Actions
   document
     .getElementById("btn-lookup-profile")
     ?.addEventListener("click", lookupLichessProfile);
   document
     .getElementById("btn-trigger-pipeline")
     ?.addEventListener("click", () => triggerGitHubPipeline(null));
-  document
-    .getElementById("btn-trigger-active-player")
-    ?.addEventListener("click", () => {
-      if (state.activePlayer === "__ALL__") {
-        showToast("Select a specific player to trigger a Lichess pull.");
-        return;
-      }
-      triggerGitHubPipeline(state.activePlayer);
-    });
   document
     .getElementById("btn-sync-active-player")
     ?.addEventListener("click", () => {
@@ -1258,7 +1681,10 @@ function bindEvents() {
     ?.addEventListener("click", () => loadPlayersDirectory(true));
   document
     .getElementById("btn-refresh-runs")
-    ?.addEventListener("click", () => loadRecentRuns());
+    ?.addEventListener("click", async () => {
+      await loadRecentRuns(true);
+      await refreshCacheTelemetry();
+    });
 
   // Export CSV
   document.getElementById("btn-export-csv")?.addEventListener("click", () => {
@@ -1276,6 +1702,7 @@ function bindEvents() {
       state.activePlayer
     )}?${params.toString()}`;
   });
+
   // Auth unlock handlers
   document
     .getElementById("btn-unlock-trigger")
@@ -1299,7 +1726,7 @@ function bindEvents() {
         await verifyPortalToken(key);
         await Promise.all([
           loadPlayersDirectory(false),
-          loadRecentRuns(),
+          loadRecentRuns(false),
           fetchDashboardData(false),
         ]);
       } catch (err) {
@@ -1316,7 +1743,9 @@ function bindEvents() {
           unlockBox.style.display === "none" ? "flex" : "none";
       } else {
         showToast(
-          `Pipeline is open with rate limiting (${state.authStatus?.cooldown_seconds || 120}s cooldown, ${state.authStatus?.max_triggers_per_hour || 10}/hr).`
+          `Pipeline is open with rate limiting (${
+            state.authStatus?.cooldown_seconds || 120
+          }s cooldown, ${state.authStatus?.max_triggers_per_hour || 10}/hr).`
         );
       }
     });
@@ -1324,13 +1753,16 @@ function bindEvents() {
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
+  const initialPage = getPageFromHash();
+  navigateTo(initialPage, false);
+
   const auth = await checkAuthStatus();
   if (auth && auth.view_protected && !auth.view_authorized) {
     return;
   }
   await Promise.all([
     loadPlayersDirectory(false),
-    loadRecentRuns(),
+    loadRecentRuns(false),
     fetchDashboardData(false),
   ]);
 });

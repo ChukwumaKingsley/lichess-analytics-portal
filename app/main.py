@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -90,15 +90,27 @@ def auth_verify(req: AuthVerifyRequest):
     }
 
 
+@app.get("/api/cache/stats")
+def cache_stats(request: Request):
+    access_guard.require_view_access(request)
+    return warehouse.get_cache_stats()
+
+
 @app.get("/api/players")
-def list_players(request: Request, refresh: bool = Query(False)):
+def list_players(request: Request, response: Response, refresh: bool = Query(False)):
     access_guard.require_view_access(request)
     try:
         players = warehouse.discover_players(force_refresh=refresh)
+        if not refresh:
+            scope = "private" if access_guard.is_view_protected() else "public"
+            response.headers["Cache-Control"] = f"{scope}, max-age=180"
+        else:
+            response.headers["Cache-Control"] = "no-store"
         return {
             "players": players,
             "total_players": len(players),
             "drive_folder_id": DRIVE_PARENT_FOLDER_ID,
+            "cache_stats": warehouse.get_cache_stats(),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -124,6 +136,7 @@ def sync_player_endpoint(request: Request, username: str, force: bool = Query(Tr
 @app.get("/api/dashboard/{username}")
 def get_dashboard(
     request: Request,
+    response: Response,
     username: str,
     color: str = Query("all"),
     speed: str = Query("all"),
@@ -138,7 +151,7 @@ def get_dashboard(
 ):
     access_guard.require_view_access(request)
     try:
-        return warehouse.get_dashboard_data(
+        data = warehouse.get_dashboard_data(
             username=username,
             color=color,
             speed=speed,
@@ -151,6 +164,12 @@ def get_dashboard(
             page_size=page_size,
             force_sync=force_sync,
         )
+        if not force_sync:
+            scope = "private" if access_guard.is_view_protected() else "public"
+            response.headers["Cache-Control"] = f"{scope}, max-age=180"
+        else:
+            response.headers["Cache-Control"] = "no-store"
+        return data
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
