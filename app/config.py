@@ -46,3 +46,11 @@ ALLOWED_TRIGGER_PLAYERS = os.getenv("ALLOWED_TRIGGER_PLAYERS", "").strip()
 # Rate-limiting defaults to protect GitHub Actions quota
 TRIGGER_COOLDOWN_SECONDS = int(os.getenv("TRIGGER_COOLDOWN_SECONDS", "120"))
 TRIGGER_MAX_PER_HOUR = int(os.getenv("TRIGGER_MAX_PER_HOUR", "10"))
+
+# ---------------------------------------------------------------------------
+# Multi-Layer Caching TTLs (Reduce Google Drive API calls & recomputation)
+# ---------------------------------------------------------------------------
+DRIVE_FOLDER_CACHE_TTL = int(os.getenv("DRIVE_FOLDER_CACHE_TTL", "300"))
+PLAYER_SYNC_TTL_SECONDS = int(os.getenv("PLAYER_SYNC_TTL_SECONDS", "600"))
+DASHBOARD_CACHE_TTL_SECONDS = int(os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "300"))
+

@@ -1,6 +1,7 @@
 import math
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,7 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from app.config import DATA_CACHE_DIR, WAREHOUSE_DB_PATH
+from app.config import (
+    DASHBOARD_CACHE_TTL_SECONDS,
+    DATA_CACHE_DIR,
+    DRIVE_FOLDER_CACHE_TTL,
+    PLAYER_SYNC_TTL_SECONDS,
+    WAREHOUSE_DB_PATH,
+)
 from app.drive_client import DriveClient
 
 
@@ -50,7 +57,36 @@ class LichessWarehouse:
         self._games_cache: Dict[str, pd.DataFrame] = {}
         self._ratings_cache: Dict[str, pd.DataFrame] = {}
         self._player_folders: Dict[str, Dict[str, Any]] = {}
+        self._folders_cached_at: float = 0.0
+        self._dashboard_cache: Dict[Tuple, Tuple[float, Dict[str, Any]]] = {}
+        self._drive_calls_saved: int = 0
+        self._drive_calls_made: int = 0
         self._init_db()
+
+    def _invalidate_dashboard_cache(self, username: Optional[str] = None) -> None:
+        with self._lock:
+            if username is None:
+                self._dashboard_cache.clear()
+            else:
+                keys_to_del = [
+                    k
+                    for k in self._dashboard_cache
+                    if k[0].lower() in (username.lower(), "__all__")
+                ]
+                for k in keys_to_del:
+                    del self._dashboard_cache[k]
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "cached_players_in_memory": len(self._games_cache),
+                "cached_dashboard_queries": len(self._dashboard_cache),
+                "cached_drive_folders": len(self._player_folders),
+                "drive_calls_made": self._drive_calls_made,
+                "drive_calls_saved": self._drive_calls_saved,
+                "folder_cache_ttl_s": DRIVE_FOLDER_CACHE_TTL,
+                "player_sync_ttl_s": PLAYER_SYNC_TTL_SECONDS,
+            }
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(WAREHOUSE_DB_PATH), check_same_thread=False)
@@ -80,13 +116,19 @@ class LichessWarehouse:
             conn.commit()
 
     def discover_players(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """Discover all player folders in Google Drive and merge with warehouse sync status."""
-        if force_refresh or not self._player_folders:
+        """Discover all player folders in Google Drive (with TTL cache) and merge with warehouse sync status."""
+        now = time.time()
+        cache_expired = (now - self._folders_cached_at) > DRIVE_FOLDER_CACHE_TTL
+        if force_refresh or not self._player_folders or cache_expired:
             try:
                 folders = self.drive.list_player_folders()
                 self._player_folders = {f["name"]: f for f in folders}
+                self._folders_cached_at = time.time()
+                self._drive_calls_made += 1
             except Exception as exc:
                 print(f"[Warehouse] Warning listing Drive folders: {exc}")
+        else:
+            self._drive_calls_saved += 1
 
         with self._get_conn() as conn:
             rows = conn.execute("SELECT * FROM sync_metadata").fetchall()
@@ -128,15 +170,12 @@ class LichessWarehouse:
 
     def sync_player(self, username: str, force: bool = False) -> Dict[str, Any]:
         """
-        Sync a player's CSV files from Google Drive into local cache and SQLite warehouse,
-        performing the SSIS Conditional Split (All / White / Black) and schema normalization.
+        Sync a player's CSV files from Google Drive into local cache and SQLite warehouse.
+        Skips Drive metadata/download calls when local CSV is fresh within PLAYER_SYNC_TTL_SECONDS
+        unless force=True.
         """
-        if not self._player_folders or username not in self._player_folders:
-            try:
-                folders = self.drive.list_player_folders()
-                self._player_folders = {f["name"]: f for f in folders}
-            except Exception as exc:
-                print(f"[Warehouse] Could not refresh folders: {exc}")
+        if not self._player_folders:
+            self.discover_players(force_refresh=False)
 
         # Case-insensitive match if user typed slightly different casing
         matched_name = username
@@ -145,6 +184,13 @@ class LichessWarehouse:
                 matched_name = k
                 break
         username = matched_name
+
+        if username not in self._player_folders and force:
+            self.discover_players(force_refresh=True)
+            for k in self._player_folders:
+                if k.lower() == username.lower():
+                    username = k
+                    break
 
         folder_info = self._player_folders.get(username)
         player_dir = DATA_CACHE_DIR / username
@@ -158,36 +204,54 @@ class LichessWarehouse:
             ).fetchone()
             existing_meta = dict(row) if row else {}
 
+        # Determine if local disk cache is still fresh enough to avoid hitting Drive API
+        local_is_fresh = False
+        if not force and games_csv_path.exists() and existing_meta.get("last_synced_at"):
+            try:
+                last_dt = datetime.fromisoformat(existing_meta["last_synced_at"])
+                age_s = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                if age_s < PLAYER_SYNC_TTL_SECONDS:
+                    local_is_fresh = True
+            except Exception:
+                pass
+
         games_file_meta = {}
         rating_file_meta = {}
 
-        if folder_info and folder_info.get("id"):
+        if local_is_fresh:
+            self._drive_calls_saved += 1
+        elif folder_info and folder_info.get("id"):
             folder_id = folder_info["id"]
             files_map = self.drive.get_player_files_metadata(folder_id)
+            self._drive_calls_made += 1
             games_file_meta = files_map.get(f"games_{username}.csv", {})
             rating_file_meta = files_map.get(f"rating_history_{username}.csv", {})
 
-            # Download games CSV if missing, forced, or newer on Drive
+            # Download games CSV only if missing or modifiedTime on Drive changed
             if games_file_meta.get("id"):
                 need_games_dl = (
-                    force
-                    or not games_csv_path.exists()
+                    not games_csv_path.exists()
                     or games_file_meta.get("modifiedTime")
                     != existing_meta.get("games_modified_time")
                 )
                 if need_games_dl:
                     self.drive.download_file(games_file_meta["id"], games_csv_path)
+                    self._drive_calls_made += 1
+                else:
+                    self._drive_calls_saved += 1
 
-            # Download rating history CSV if missing, forced, or newer on Drive
+            # Download rating history CSV only if missing or modifiedTime on Drive changed
             if rating_file_meta.get("id"):
                 need_rating_dl = (
-                    force
-                    or not rating_csv_path.exists()
+                    not rating_csv_path.exists()
                     or rating_file_meta.get("modifiedTime")
                     != existing_meta.get("rating_modified_time")
                 )
                 if need_rating_dl:
                     self.drive.download_file(rating_file_meta["id"], rating_csv_path)
+                    self._drive_calls_made += 1
+                else:
+                    self._drive_calls_saved += 1
 
         # Load and normalize DataFrames
         df_games = self._load_and_normalize_games(username, games_csv_path)
@@ -196,6 +260,7 @@ class LichessWarehouse:
         with self._lock:
             self._games_cache[username] = df_games
             self._ratings_cache[username] = df_ratings
+        self._invalidate_dashboard_cache(username)
 
         total_games = len(df_games)
         white_games = (
@@ -451,6 +516,32 @@ class LichessWarehouse:
         page_size: int = 25,
         force_sync: bool = False,
     ) -> Dict[str, Any]:
+        cache_key = (
+            username.lower(),
+            color.lower(),
+            speed.lower(),
+            rated.lower(),
+            source.lower(),
+            date_from or "",
+            date_to or "",
+            (search or "").strip().lower(),
+            page,
+            page_size,
+        )
+        if not force_sync:
+            with self._lock:
+                cached_entry = self._dashboard_cache.get(cache_key)
+                if (
+                    cached_entry
+                    and (time.time() - cached_entry[0]) < DASHBOARD_CACHE_TTL_SECONDS
+                ):
+                    payload = dict(cached_entry[1])
+                    payload["cache_info"] = {
+                        "source": "memory_cache",
+                        "cached_at": cached_entry[0],
+                    }
+                    return payload
+
         df_raw, df_ratings = self.ensure_player_loaded(username, force_sync=force_sync)
 
         if df_raw.empty:
@@ -458,6 +549,7 @@ class LichessWarehouse:
                 "username": username,
                 "empty": True,
                 "summary": self._compute_slice_stats(df_raw),
+                "cache_info": {"source": "empty"},
             }
 
         # Apply base filters (before color split, so we can show White vs Black side-by-side)
@@ -744,7 +836,7 @@ class LichessWarehouse:
                 }
             )
 
-        return {
+        result_payload = {
             "username": username,
             "empty": False,
             "filters_applied": {
@@ -776,7 +868,20 @@ class LichessWarehouse:
                 "total_pages": max(1, math.ceil(total / page_size)),
                 "items": games_list,
             },
+            "cache_info": {
+                "source": "drive_sync" if force_sync else "warehouse_compute",
+                "cached_at": time.time(),
+            },
         }
+        with self._lock:
+            if len(self._dashboard_cache) > 128:
+                # Evict oldest entry
+                oldest_key = min(
+                    self._dashboard_cache, key=lambda k: self._dashboard_cache[k][0]
+                )
+                del self._dashboard_cache[oldest_key]
+            self._dashboard_cache[cache_key] = (time.time(), result_payload)
+        return result_payload
 
     def _build_rating_history_payload(
         self,

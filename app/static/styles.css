@@ -177,6 +177,80 @@ html, body {
   gap: 6px;
 }
 
+/* Multi-Page Dimensional Navigation */
+.nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  min-width: 0;
+}
+
+.nav-item:hover {
+  background: var(--bg-surface-2);
+  color: var(--text-primary);
+}
+
+.nav-item.active {
+  background: var(--accent-amber-soft);
+  border-color: hsla(37, 86%, 56%, 0.32);
+  color: var(--accent-amber);
+}
+
+.nav-icon {
+  font-size: 13px;
+  width: 16px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.nav-live-dot {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-amber);
+  box-shadow: 0 0 8px var(--accent-amber);
+  animation: pulseDot 1.4s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+@media (max-width: 1024px) {
+  .nav-list {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 5px;
+  }
+}
+
+@media (max-width: 560px) {
+  .nav-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 /* Pipeline Trigger Card */
 .trigger-box {
   background: var(--bg-surface-2);
@@ -366,6 +440,9 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 2px;
 }
 
 .player-item {
@@ -536,6 +613,36 @@ html, body {
   color: var(--text-secondary);
 }
 
+.flow-step-chip.cache-chip {
+  border-color: hsla(154, 64%, 46%, 0.28);
+  color: var(--win-green);
+  background: var(--win-green-soft);
+}
+
+.flow-step-chip.cache-chip.sync {
+  border-color: hsla(37, 86%, 56%, 0.35);
+  color: var(--accent-amber);
+  background: var(--accent-amber-soft);
+}
+
+/* Multi-Page Report Containers */
+.report-page {
+  display: none;
+  min-width: 0;
+}
+
+.report-page.active {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: fadeInPage 160ms ease-out;
+}
+
+@keyframes fadeInPage {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 .header-actions {
   display: flex;
   flex-wrap: wrap;
@@ -652,9 +759,19 @@ html, body {
   min-width: 0;
 }
 
+.kpi-grid.kpi-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 @media (max-width: 1280px) {
   .kpi-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .kpi-grid.kpi-grid-3 {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -695,6 +812,14 @@ html, body {
   letter-spacing: -0.02em;
   color: var(--text-primary);
   line-height: 1.15;
+}
+
+.kpi-value.sm {
+  font-size: 14px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .kpi-sub {
@@ -879,6 +1004,52 @@ html, body {
 
 .chart-canvas-wrap.sm {
   height: 200px;
+}
+
+.chart-canvas-wrap.lg {
+  height: 320px;
+}
+
+.category-pills-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cat-pill {
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 4px 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+}
+
+.cat-pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.cat-pill-name {
+  text-transform: capitalize;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.cat-pill-val {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.cat-pill-peak {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
 }
 
 /* ==========================================================================
