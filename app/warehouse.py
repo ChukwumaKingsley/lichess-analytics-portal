@@ -1,22 +1,25 @@
+from collections import OrderedDict
+from contextlib import closing, contextmanager
+from datetime import datetime, timezone
+import logging
 import math
+from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from app.config import (
-    DASHBOARD_CACHE_TTL_SECONDS,
-    DATA_CACHE_DIR,
-    DRIVE_FOLDER_CACHE_TTL,
-    PLAYER_SYNC_TTL_SECONDS,
-    WAREHOUSE_DB_PATH,
-)
+from app import config
 from app.drive_client import DriveClient
+
+logger = logging.getLogger(__name__)
+
+USERNAME_RE = re.compile(r"^(__ALL__|[A-Za-z0-9_-]{2,30})$")
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _clean_num(val: Any, decimals: int = 1) -> Optional[float]:
@@ -43,6 +46,12 @@ def _clean_int(val: Any, default: int = 0) -> int:
         return default
 
 
+def _sanitize_csv_cell(val: Any) -> Any:
+    if isinstance(val, str) and val.startswith(FORMULA_PREFIXES):
+        return f"'{val}"
+    return val
+
+
 class LichessWarehouse:
     """
     Automated SSIS-Replacement Warehouse & Real-Time Analytics Engine.
@@ -54,47 +63,101 @@ class LichessWarehouse:
     def __init__(self, drive_client: DriveClient):
         self.drive = drive_client
         self._lock = threading.Lock()
-        self._games_cache: Dict[str, pd.DataFrame] = {}
-        self._ratings_cache: Dict[str, pd.DataFrame] = {}
+        self._discovery_lock = threading.Lock()
+        self._player_locks: Dict[str, threading.Lock] = {}
+        self._games_cache: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
+        self._ratings_cache: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
         self._player_folders: Dict[str, Dict[str, Any]] = {}
         self._folders_cached_at: float = 0.0
-        self._dashboard_cache: Dict[Tuple, Tuple[float, Dict[str, Any]]] = {}
+        # Maps slice_cache_key (without page/page_size) -> (cached_at, base_payload, filtered_df)
+        self._dashboard_cache: "OrderedDict[Tuple, Tuple[float, Dict[str, Any], pd.DataFrame]]" = (
+            OrderedDict()
+        )
         self._drive_calls_saved: int = 0
         self._drive_calls_made: int = 0
         self._init_db()
+
+    @staticmethod
+    def _validate_username(username: str, allow_all: bool = True) -> str:
+        cleaned = (username or "").strip()
+        if not allow_all and cleaned == "__ALL__":
+            raise ValueError("Invalid Lichess username: '__ALL__' is not allowed here.")
+        if not USERNAME_RE.fullmatch(cleaned):
+            raise ValueError(
+                f"Invalid Lichess username '{username}'. Use 2-30 letters, digits, '_', or '-'."
+            )
+        return cleaned
+
+    def _get_player_lock(self, username: str) -> threading.Lock:
+        key = username.lower()
+        with self._lock:
+            lock = self._player_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._player_locks[key] = lock
+            return lock
+
+    def _store_player_frames(
+        self, username: str, df_games: pd.DataFrame, df_ratings: pd.DataFrame
+    ) -> None:
+        max_players = max(4, int(getattr(config, "MAX_CACHED_PLAYERS_IN_MEMORY", 16)))
+        with self._lock:
+            self._games_cache[username] = df_games
+            self._games_cache.move_to_end(username)
+            self._ratings_cache[username] = df_ratings
+            self._ratings_cache.move_to_end(username)
+            # Also invalidate any cached __ALL__ combined DataFrame
+            self._games_cache.pop("__ALL__", None)
+            self._ratings_cache.pop("__ALL__", None)
+
+            while len(self._games_cache) > max_players:
+                evicted_user, _ = self._games_cache.popitem(last=False)
+                self._ratings_cache.pop(evicted_user, None)
 
     def _invalidate_dashboard_cache(self, username: Optional[str] = None) -> None:
         with self._lock:
             if username is None:
                 self._dashboard_cache.clear()
             else:
+                target = username.lower()
                 keys_to_del = [
                     k
                     for k in self._dashboard_cache
-                    if k[0].lower() in (username.lower(), "__all__")
+                    if k[0].lower() in (target, "__all__")
                 ]
                 for k in keys_to_del:
                     del self._dashboard_cache[k]
 
     def get_cache_stats(self) -> Dict[str, Any]:
         with self._lock:
+            mem_players = len(
+                [k for k in self._games_cache if k != "__ALL__"]
+            )
             return {
-                "cached_players_in_memory": len(self._games_cache),
+                "cached_players_in_memory": mem_players,
                 "cached_dashboard_queries": len(self._dashboard_cache),
                 "cached_drive_folders": len(self._player_folders),
                 "drive_calls_made": self._drive_calls_made,
                 "drive_calls_saved": self._drive_calls_saved,
-                "folder_cache_ttl_s": DRIVE_FOLDER_CACHE_TTL,
-                "player_sync_ttl_s": PLAYER_SYNC_TTL_SECONDS,
+                "folder_cache_ttl_s": config.DRIVE_FOLDER_CACHE_TTL,
+                "player_sync_ttl_s": config.PLAYER_SYNC_TTL_SECONDS,
             }
 
-    def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(WAREHOUSE_DB_PATH), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @contextmanager
+    def _db_conn(self) -> Generator[sqlite3.Connection, None, None]:
+        raw_conn = sqlite3.connect(
+            str(config.WAREHOUSE_DB_PATH),
+            timeout=15.0,
+            check_same_thread=False,
+        )
+        raw_conn.row_factory = sqlite3.Row
+        with closing(raw_conn) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            yield conn
 
     def _init_db(self) -> None:
-        with self._get_conn() as conn:
+        with self._db_conn() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sync_metadata (
@@ -116,41 +179,71 @@ class LichessWarehouse:
             conn.commit()
 
     def discover_players(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """Discover all player folders in Google Drive (with TTL cache) and merge with warehouse sync status."""
-        now = time.time()
-        cache_expired = (now - self._folders_cached_at) > DRIVE_FOLDER_CACHE_TTL
-        if force_refresh or not self._player_folders or cache_expired:
-            try:
-                folders = self.drive.list_player_folders()
-                self._player_folders = {f["name"]: f for f in folders}
-                self._folders_cached_at = time.time()
-                self._drive_calls_made += 1
-            except Exception as exc:
-                print(f"[Warehouse] Warning listing Drive folders: {exc}")
-        else:
-            self._drive_calls_saved += 1
+        """
+        Discover all player folders in Google Drive (with thread-safe TTL cache and cold-start deduplication)
+        and merge with warehouse sync status.
+        """
+        with self._discovery_lock:
+            now = time.time()
+            with self._lock:
+                cache_expired = (
+                    now - self._folders_cached_at
+                ) > config.DRIVE_FOLDER_CACHE_TTL
+                need_fetch = force_refresh or not self._player_folders or cache_expired
 
-        with self._get_conn() as conn:
+            if need_fetch:
+                try:
+                    folders = self.drive.list_player_folders()
+                    valid_folders = {
+                        f["name"]: f
+                        for f in folders
+                        if f.get("name") and USERNAME_RE.fullmatch(f["name"])
+                    }
+                    with self._lock:
+                        self._player_folders = valid_folders
+                        self._folders_cached_at = time.time()
+                        self._drive_calls_made += 1
+                except Exception as exc:
+                    logger.warning("[Warehouse] Warning listing Drive folders: %s", exc)
+            else:
+                with self._lock:
+                    self._drive_calls_saved += 1
+
+        with self._lock:
+            folders_snapshot = dict(self._player_folders)
+
+        with self._db_conn() as conn:
             rows = conn.execute("SELECT * FROM sync_metadata").fetchall()
-            meta_map = {r["username"]: dict(r) for r in rows}
+            meta_map = {
+                r["username"]: dict(r)
+                for r in rows
+                if r["username"] and USERNAME_RE.fullmatch(r["username"])
+            }
 
-        # Also check any locally cached player directories
+        # Only include locally cached directories that actually contain a games CSV
         local_players = set()
-        if DATA_CACHE_DIR.exists():
-            for child in DATA_CACHE_DIR.iterdir():
-                if child.is_dir() and not child.name.startswith("."):
+        if config.DATA_CACHE_DIR.exists():
+            for child in config.DATA_CACHE_DIR.iterdir():
+                if (
+                    child.is_dir()
+                    and not child.name.startswith(".")
+                    and USERNAME_RE.fullmatch(child.name)
+                    and (child / f"games_{child.name}.csv").exists()
+                ):
                     local_players.add(child.name)
 
         all_usernames = sorted(
-            set(self._player_folders.keys()) | set(meta_map.keys()) | local_players,
+            set(folders_snapshot.keys())
+            | {u for u, m in meta_map.items() if m.get("total_games", 0) > 0}
+            | local_players,
             key=lambda s: s.lower(),
         )
 
         players_list = []
         for uname in all_usernames:
-            f_info = self._player_folders.get(uname, {})
+            f_info = folders_snapshot.get(uname, {})
             m_info = meta_map.get(uname, {})
-            local_csv = DATA_CACHE_DIR / uname / f"games_{uname}.csv"
+            local_csv = config.DATA_CACHE_DIR / uname / f"games_{uname}.csv"
             is_cached = local_csv.exists()
             players_list.append(
                 {
@@ -172,160 +265,202 @@ class LichessWarehouse:
         """
         Sync a player's CSV files from Google Drive into local cache and SQLite warehouse.
         Skips Drive metadata/download calls when local CSV is fresh within PLAYER_SYNC_TTL_SECONDS
-        unless force=True.
+        unless force=True. Thread-safe per player (CONC-02) and safe against path traversal (SEC-02).
         """
-        if not self._player_folders:
-            self.discover_players(force_refresh=False)
-
-        # Case-insensitive match if user typed slightly different casing
-        matched_name = username
-        for k in self._player_folders:
-            if k.lower() == username.lower():
-                matched_name = k
-                break
-        username = matched_name
-
-        if username not in self._player_folders and force:
-            self.discover_players(force_refresh=True)
-            for k in self._player_folders:
-                if k.lower() == username.lower():
-                    username = k
-                    break
-
-        folder_info = self._player_folders.get(username)
-        player_dir = DATA_CACHE_DIR / username
-        player_dir.mkdir(parents=True, exist_ok=True)
-        games_csv_path = player_dir / f"games_{username}.csv"
-        rating_csv_path = player_dir / f"rating_history_{username}.csv"
-
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM sync_metadata WHERE username = ?", (username,)
-            ).fetchone()
-            existing_meta = dict(row) if row else {}
-
-        # Determine if local disk cache is still fresh enough to avoid hitting Drive API
-        local_is_fresh = False
-        if not force and games_csv_path.exists() and existing_meta.get("last_synced_at"):
-            try:
-                last_dt = datetime.fromisoformat(existing_meta["last_synced_at"])
-                age_s = (datetime.now(timezone.utc) - last_dt).total_seconds()
-                if age_s < PLAYER_SYNC_TTL_SECONDS:
-                    local_is_fresh = True
-            except Exception:
-                pass
-
-        games_file_meta = {}
-        rating_file_meta = {}
-
-        if local_is_fresh:
-            self._drive_calls_saved += 1
-        elif folder_info and folder_info.get("id"):
-            folder_id = folder_info["id"]
-            files_map = self.drive.get_player_files_metadata(folder_id)
-            self._drive_calls_made += 1
-            games_file_meta = files_map.get(f"games_{username}.csv", {})
-            rating_file_meta = files_map.get(f"rating_history_{username}.csv", {})
-
-            # Download games CSV only if missing or modifiedTime on Drive changed
-            if games_file_meta.get("id"):
-                need_games_dl = (
-                    not games_csv_path.exists()
-                    or games_file_meta.get("modifiedTime")
-                    != existing_meta.get("games_modified_time")
-                )
-                if need_games_dl:
-                    self.drive.download_file(games_file_meta["id"], games_csv_path)
-                    self._drive_calls_made += 1
-                else:
-                    self._drive_calls_saved += 1
-
-            # Download rating history CSV only if missing or modifiedTime on Drive changed
-            if rating_file_meta.get("id"):
-                need_rating_dl = (
-                    not rating_csv_path.exists()
-                    or rating_file_meta.get("modifiedTime")
-                    != existing_meta.get("rating_modified_time")
-                )
-                if need_rating_dl:
-                    self.drive.download_file(rating_file_meta["id"], rating_csv_path)
-                    self._drive_calls_made += 1
-                else:
-                    self._drive_calls_saved += 1
-
-        # Load and normalize DataFrames
-        df_games = self._load_and_normalize_games(username, games_csv_path)
-        df_ratings = self._load_and_normalize_ratings(username, rating_csv_path)
+        username = self._validate_username(username, allow_all=False)
 
         with self._lock:
-            self._games_cache[username] = df_games
-            self._ratings_cache[username] = df_ratings
-        self._invalidate_dashboard_cache(username)
+            has_folders = bool(self._player_folders)
+        if not has_folders:
+            self.discover_players(force_refresh=False)
 
-        total_games = len(df_games)
-        white_games = (
-            int((df_games["played_as"] == "white").sum()) if total_games > 0 else 0
-        )
-        black_games = (
-            int((df_games["played_as"] == "black").sum()) if total_games > 0 else 0
-        )
-        rating_days = len(df_ratings)
-        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            matched_name = username
+            for k in self._player_folders:
+                if k.lower() == username.lower():
+                    matched_name = k
+                    break
+            username = matched_name
+            known_in_drive = username in self._player_folders
 
-        # Persist to SQLite warehouse tables (mirroring SSIS Destination tables)
-        with self._get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO sync_metadata (
-                    username, folder_id, games_file_id, games_modified_time, games_size,
-                    rating_file_id, rating_modified_time, total_games, white_games,
-                    black_games, rating_days, last_synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username) DO UPDATE SET
-                    folder_id = excluded.folder_id,
-                    games_file_id = excluded.games_file_id,
-                    games_modified_time = excluded.games_modified_time,
-                    games_size = excluded.games_size,
-                    rating_file_id = excluded.rating_file_id,
-                    rating_modified_time = excluded.rating_modified_time,
-                    total_games = excluded.total_games,
-                    white_games = excluded.white_games,
-                    black_games = excluded.black_games,
-                    rating_days = excluded.rating_days,
-                    last_synced_at = excluded.last_synced_at
-                """,
-                (
-                    username,
-                    folder_info.get("id") if folder_info else existing_meta.get("folder_id"),
-                    games_file_meta.get("id", existing_meta.get("games_file_id")),
-                    games_file_meta.get(
-                        "modifiedTime", existing_meta.get("games_modified_time")
-                    ),
-                    int(games_file_meta.get("size", 0) or 0),
-                    rating_file_meta.get("id", existing_meta.get("rating_file_id")),
-                    rating_file_meta.get(
-                        "modifiedTime", existing_meta.get("rating_modified_time")
-                    ),
-                    total_games,
-                    white_games,
-                    black_games,
-                    rating_days,
-                    now_iso,
-                ),
+        if not known_in_drive and force:
+            self.discover_players(force_refresh=True)
+            with self._lock:
+                for k in self._player_folders:
+                    if k.lower() == username.lower():
+                        username = k
+                        break
+
+        player_lock = self._get_player_lock(username)
+        with player_lock:
+            with self._lock:
+                folder_info = self._player_folders.get(username)
+
+            base_cache_dir = config.DATA_CACHE_DIR.resolve()
+            player_dir = (config.DATA_CACHE_DIR / username).resolve()
+            if not player_dir.is_relative_to(base_cache_dir):
+                raise ValueError(f"Path traversal blocked for username '{username}'.")
+
+            games_csv_path = player_dir / f"games_{username}.csv"
+            rating_csv_path = player_dir / f"rating_history_{username}.csv"
+
+            # SEC-02 fix: if player does not exist in Drive and has no local CSV, do not create directories or DB rows
+            if not folder_info and not games_csv_path.exists():
+                return {
+                    "username": username,
+                    "total_games": 0,
+                    "white_games": 0,
+                    "black_games": 0,
+                    "rating_days": 0,
+                    "games_modified_time": None,
+                    "last_synced_at": None,
+                }
+
+            player_dir.mkdir(parents=True, exist_ok=True)
+
+            with self._db_conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM sync_metadata WHERE username = ?", (username,)
+                ).fetchone()
+                existing_meta = dict(row) if row else {}
+
+            local_is_fresh = False
+            if (
+                not force
+                and games_csv_path.exists()
+                and existing_meta.get("last_synced_at")
+            ):
+                try:
+                    last_dt = datetime.fromisoformat(existing_meta["last_synced_at"])
+                    age_s = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                    if age_s < config.PLAYER_SYNC_TTL_SECONDS:
+                        local_is_fresh = True
+                except Exception:
+                    pass
+
+            games_file_meta: Dict[str, Any] = {}
+            rating_file_meta: Dict[str, Any] = {}
+
+            if local_is_fresh:
+                with self._lock:
+                    self._drive_calls_saved += 1
+            elif folder_info and folder_info.get("id"):
+                folder_id = folder_info["id"]
+                files_map = self.drive.get_player_files_metadata(folder_id)
+                with self._lock:
+                    self._drive_calls_made += 1
+                games_file_meta = files_map.get(f"games_{username}.csv", {})
+                rating_file_meta = files_map.get(f"rating_history_{username}.csv", {})
+
+                if games_file_meta.get("id"):
+                    need_games_dl = (
+                        not games_csv_path.exists()
+                        or games_file_meta.get("modifiedTime")
+                        != existing_meta.get("games_modified_time")
+                    )
+                    if need_games_dl:
+                        self.drive.download_file(
+                            games_file_meta["id"], games_csv_path
+                        )
+                        with self._lock:
+                            self._drive_calls_made += 1
+                    else:
+                        with self._lock:
+                            self._drive_calls_saved += 1
+
+                if rating_file_meta.get("id"):
+                    need_rating_dl = (
+                        not rating_csv_path.exists()
+                        or rating_file_meta.get("modifiedTime")
+                        != existing_meta.get("rating_modified_time")
+                    )
+                    if need_rating_dl:
+                        self.drive.download_file(
+                            rating_file_meta["id"], rating_csv_path
+                        )
+                        with self._lock:
+                            self._drive_calls_made += 1
+                    else:
+                        with self._lock:
+                            self._drive_calls_saved += 1
+
+            df_games = self._load_and_normalize_games(username, games_csv_path)
+            df_ratings = self._load_and_normalize_ratings(username, rating_csv_path)
+
+            self._store_player_frames(username, df_games, df_ratings)
+            self._invalidate_dashboard_cache(username)
+
+            total_games = len(df_games)
+            white_games = (
+                int((df_games["played_as"] == "white").sum())
+                if total_games > 0
+                else 0
             )
-            conn.commit()
+            black_games = (
+                int((df_games["played_as"] == "black").sum())
+                if total_games > 0
+                else 0
+            )
+            rating_days = len(df_ratings)
+            now_iso = datetime.now(timezone.utc).isoformat()
 
-        return {
-            "username": username,
-            "total_games": total_games,
-            "white_games": white_games,
-            "black_games": black_games,
-            "rating_days": rating_days,
-            "games_modified_time": games_file_meta.get(
-                "modifiedTime", existing_meta.get("games_modified_time")
-            ),
-            "last_synced_at": now_iso,
-        }
+            with self._db_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO sync_metadata (
+                        username, folder_id, games_file_id, games_modified_time, games_size,
+                        rating_file_id, rating_modified_time, total_games, white_games,
+                        black_games, rating_days, last_synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(username) DO UPDATE SET
+                        folder_id = excluded.folder_id,
+                        games_file_id = excluded.games_file_id,
+                        games_modified_time = excluded.games_modified_time,
+                        games_size = excluded.games_size,
+                        rating_file_id = excluded.rating_file_id,
+                        rating_modified_time = excluded.rating_modified_time,
+                        total_games = excluded.total_games,
+                        white_games = excluded.white_games,
+                        black_games = excluded.black_games,
+                        rating_days = excluded.rating_days,
+                        last_synced_at = excluded.last_synced_at
+                    """,
+                    (
+                        username,
+                        folder_info.get("id")
+                        if folder_info
+                        else existing_meta.get("folder_id"),
+                        games_file_meta.get("id", existing_meta.get("games_file_id")),
+                        games_file_meta.get(
+                            "modifiedTime", existing_meta.get("games_modified_time")
+                        ),
+                        int(games_file_meta.get("size", 0) or 0),
+                        rating_file_meta.get(
+                            "id", existing_meta.get("rating_file_id")
+                        ),
+                        rating_file_meta.get(
+                            "modifiedTime", existing_meta.get("rating_modified_time")
+                        ),
+                        total_games,
+                        white_games,
+                        black_games,
+                        rating_days,
+                        now_iso,
+                    ),
+                )
+                conn.commit()
+
+            return {
+                "username": username,
+                "total_games": total_games,
+                "white_games": white_games,
+                "black_games": black_games,
+                "rating_days": rating_days,
+                "games_modified_time": games_file_meta.get(
+                    "modifiedTime", existing_meta.get("games_modified_time")
+                ),
+                "last_synced_at": now_iso,
+            }
 
     def _load_and_normalize_games(self, username: str, csv_path: Path) -> pd.DataFrame:
         if not csv_path.exists():
@@ -334,12 +469,17 @@ class LichessWarehouse:
         if df.empty:
             return df
 
-        # Deduplicate by game_id if any repeated appends occurred in preprocess_and_upload.py
         if "game_id" in df.columns:
             df = df.drop_duplicates(subset=["game_id"], keep="first")
 
-        # Normalize strings and lowercase enums
-        for col in ("played_as", "opponent_color", "result", "speed", "status", "source"):
+        for col in (
+            "played_as",
+            "opponent_color",
+            "result",
+            "speed",
+            "status",
+            "source",
+        ):
             if col in df.columns:
                 df[col] = df[col].astype(str).str.strip().str.lower()
 
@@ -348,7 +488,6 @@ class LichessWarehouse:
         else:
             df["player_name"] = df["player_name"].fillna(username)
 
-        # Normalize boolean columns
         for bcol in ("rated", "tournament"):
             if bcol in df.columns:
                 df[bcol] = (
@@ -361,7 +500,13 @@ class LichessWarehouse:
             else:
                 df[bcol] = False
 
-        # Normalize numeric columns
+        # Repair legacy CSV rows affected by historical BUG-01 where non-tournament sources were marked tournament=True
+        if "source" in df.columns:
+            non_tourney_sources = df["source"].isin(
+                ["pool", "lobby", "friend", "ai", "import"]
+            )
+            df["tournament"] = df["tournament"] & ~non_tourney_sources
+
         for ncol in (
             "player_rating",
             "player_rating_diff",
@@ -376,7 +521,6 @@ class LichessWarehouse:
             else:
                 df[ncol] = np.nan
 
-        # Parse timestamps
         df["created_dt"] = pd.to_datetime(df["created_at"], errors="coerce", utc=False)
         df = df.dropna(subset=["created_dt"]).sort_values(
             by="created_dt", ascending=False
@@ -416,14 +560,27 @@ class LichessWarehouse:
     def ensure_player_loaded(
         self, username: str, force_sync: bool = False
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        username = self._validate_username(username, allow_all=True)
         if username == "__ALL__":
-            return self._load_all_synced_players()
+            return self._load_all_synced_players(force_sync=force_sync)
 
+        # Match canonical casing if already in cache or Drive folders
         with self._lock:
+            for k in list(self._games_cache.keys()) + list(self._player_folders.keys()):
+                if k.lower() == username.lower():
+                    username = k
+                    break
             has_cached = username in self._games_cache and not force_sync
+            if has_cached:
+                self._games_cache.move_to_end(username)
+                if username in self._ratings_cache:
+                    self._ratings_cache.move_to_end(username)
+                return (
+                    self._games_cache.get(username, pd.DataFrame()),
+                    self._ratings_cache.get(username, pd.DataFrame()),
+                )
 
-        if not has_cached:
-            self.sync_player(username, force=force_sync)
+        self.sync_player(username, force=force_sync)
 
         with self._lock:
             return (
@@ -431,33 +588,61 @@ class LichessWarehouse:
                 self._ratings_cache.get(username, pd.DataFrame()),
             )
 
-    def _load_all_synced_players(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Combines all synced players into a unified DataFrame (SSIS Looping Through files.dtsx)."""
-        players = self.discover_players()
+    def _load_all_synced_players(
+        self, force_sync: bool = False
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Combines all synced players into a unified DataFrame (SSIS Looping Through files.dtsx).
+        Caches the combined '__ALL__' DataFrame until any individual player is synced (PERF-02).
+        """
+        if not force_sync:
+            with self._lock:
+                if "__ALL__" in self._games_cache:
+                    return (
+                        self._games_cache["__ALL__"],
+                        self._ratings_cache.get("__ALL__", pd.DataFrame()),
+                    )
+
+        players = self.discover_players(force_refresh=force_sync)
         dfs = []
         for p in players:
             uname = p["username"]
-            local_csv = DATA_CACHE_DIR / uname / f"games_{uname}.csv"
-            if local_csv.exists():
-                if uname not in self._games_cache:
-                    self.sync_player(uname, force=False)
-                gdf = self._games_cache.get(uname)
+            local_csv = config.DATA_CACHE_DIR / uname / f"games_{uname}.csv"
+            with self._lock:
+                in_mem = uname in self._games_cache
+            if local_csv.exists() or force_sync:
+                if not in_mem or force_sync:
+                    self.sync_player(uname, force=force_sync)
+                with self._lock:
+                    gdf = self._games_cache.get(uname)
+                if gdf is not None and not gdf.empty:
+                    dfs.append(gdf)
+
+        # BUG-06 fix: if fewer than 2 players were synced on disk (e.g. cold container restart),
+        # automatically sync available Drive player folders so __ALL__ represents the multi-player warehouse.
+        if len(dfs) < min(2, len(players)):
+            dfs = []
+            for p in players:
+                uname = p["username"]
+                self.sync_player(uname, force=False)
+                with self._lock:
+                    gdf = self._games_cache.get(uname)
                 if gdf is not None and not gdf.empty:
                     dfs.append(gdf)
 
         if not dfs:
-            # If none synced yet, sync the first available player so warehouse isn't empty
-            if players:
-                first_u = players[0]["username"]
-                self.sync_player(first_u, force=False)
-                gdf = self._games_cache.get(first_u, pd.DataFrame())
-                return gdf, self._ratings_cache.get(first_u, pd.DataFrame())
             return pd.DataFrame(), pd.DataFrame()
 
-        combined = pd.concat(dfs, ignore_index=True).sort_values(
-            by="created_dt", ascending=False
+        combined = (
+            pd.concat(dfs, ignore_index=True)
+            .drop_duplicates(subset=["game_id", "player_name"], keep="first")
+            .sort_values(by="created_dt", ascending=False)
+            .reset_index(drop=True)
         )
-        return combined.reset_index(drop=True), pd.DataFrame()
+        with self._lock:
+            self._games_cache["__ALL__"] = combined
+            self._ratings_cache["__ALL__"] = pd.DataFrame()
+        return combined, pd.DataFrame()
 
     @staticmethod
     def _compute_slice_stats(df: pd.DataFrame) -> Dict[str, Any]:
@@ -502,6 +687,56 @@ class LichessWarehouse:
             "top_opening": top_op,
         }
 
+    @staticmethod
+    def _paginate_games(
+        df: pd.DataFrame, username: str, page: int, page_size: int
+    ) -> Dict[str, Any]:
+        """
+        Fast O(page_size) pagination using to_dict(orient='records') instead of iterrows() (PERF-01).
+        """
+        total = len(df)
+        page = max(1, page)
+        page_size = max(1, min(100, page_size))
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_df = df.iloc[start_idx:end_idx]
+
+        games_list = []
+        for row in page_df.to_dict(orient="records"):
+            gid = str(row.get("game_id", ""))
+            games_list.append(
+                {
+                    "game_id": gid,
+                    "lichess_url": f"https://lichess.org/{gid}",
+                    "created_at": str(row.get("created_at", ""))[:19],
+                    "speed": str(row.get("speed", "")),
+                    "time_control": str(row.get("time_control", "")),
+                    "rated": bool(row.get("rated", False)),
+                    "source": str(row.get("source", "")),
+                    "player_name": str(row.get("player_name", username)),
+                    "played_as": str(row.get("played_as", "")),
+                    "player_rating": _clean_int(row.get("player_rating"), 0) or None,
+                    "player_rating_diff": _clean_int(row.get("player_rating_diff"), 0),
+                    "opponent_name": str(row.get("opponent_name", "")),
+                    "opponent_rating": _clean_int(row.get("opponent_rating"), 0)
+                    or None,
+                    "result": str(row.get("result", "")),
+                    "status": str(row.get("status", "")),
+                    "opening_eco": str(row.get("opening_eco", "")),
+                    "opening_name": str(row.get("opening_name", "")),
+                    "turns": _clean_int(row.get("turns"), 0) or None,
+                    "move_count": _clean_int(row.get("move_count"), 0) or None,
+                }
+            )
+
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total_filtered": total,
+            "total_pages": max(1, math.ceil(total / page_size)),
+            "items": games_list,
+        }
+
     def get_dashboard_data(
         self,
         username: str,
@@ -516,7 +751,10 @@ class LichessWarehouse:
         page_size: int = 25,
         force_sync: bool = False,
     ) -> Dict[str, Any]:
-        cache_key = (
+        username = self._validate_username(username, allow_all=True)
+
+        # PERF-01 fix: cache key is independent of (page, page_size) so pagination reuses cached analytics
+        slice_cache_key = (
             username.lower(),
             color.lower(),
             speed.lower(),
@@ -525,22 +763,27 @@ class LichessWarehouse:
             date_from or "",
             date_to or "",
             (search or "").strip().lower(),
-            page,
-            page_size,
         )
         if not force_sync:
             with self._lock:
-                cached_entry = self._dashboard_cache.get(cache_key)
+                cached_entry = self._dashboard_cache.get(slice_cache_key)
                 if (
                     cached_entry
-                    and (time.time() - cached_entry[0]) < DASHBOARD_CACHE_TTL_SECONDS
+                    and (time.time() - cached_entry[0])
+                    < config.DASHBOARD_CACHE_TTL_SECONDS
                 ):
-                    payload = dict(cached_entry[1])
-                    payload["cache_info"] = {
-                        "source": "memory_cache",
-                        "cached_at": cached_entry[0],
+                    self._dashboard_cache.move_to_end(slice_cache_key)
+                    cached_ts, base_payload, cached_df = cached_entry
+                    return {
+                        **base_payload,
+                        "recent_games": self._paginate_games(
+                            cached_df, base_payload["username"], page, page_size
+                        ),
+                        "cache_info": {
+                            "source": "memory_cache",
+                            "cached_at": cached_ts,
+                        },
                     }
-                    return payload
 
         df_raw, df_ratings = self.ensure_player_loaded(username, force_sync=force_sync)
 
@@ -552,7 +795,6 @@ class LichessWarehouse:
                 "cache_info": {"source": "empty"},
             }
 
-        # Apply base filters (before color split, so we can show White vs Black side-by-side)
         df_base = df_raw
 
         if speed and speed.lower() != "all":
@@ -582,7 +824,7 @@ class LichessWarehouse:
             )
             df_base = df_base[mask]
 
-        # Compute SSIS Conditional Split stats (White vs Black) on df_base
+        # SSIS Conditional Split stats (White vs Black) on df_base
         df_white = df_base[df_base["played_as"] == "white"]
         df_black = df_base[df_base["played_as"] == "black"]
         color_split = {
@@ -590,7 +832,6 @@ class LichessWarehouse:
             "black": self._compute_slice_stats(df_black),
         }
 
-        # Now apply active color filter for the rest of the dashboard
         if color and color.lower() in ("white", "black"):
             df = df_base[df_base["played_as"] == color.lower()]
         else:
@@ -599,18 +840,43 @@ class LichessWarehouse:
         total = len(df)
         base_stats = self._compute_slice_stats(df)
 
-        # Current rating (latest non-null rating in the filtered set)
+        # BUG-03 fix: accurate current_rating and peak_rating when speed="all" or username="__ALL__"
         current_rating = None
-        valid_ratings = df["player_rating"].dropna()
-        if not valid_ratings.empty:
-            current_rating = _clean_int(valid_ratings.iloc[0])
-
         peak_rating = None
         peak_date = None
-        if not valid_ratings.empty:
-            idx_max = df["player_rating"].idxmax()
-            peak_rating = _clean_int(df.loc[idx_max, "player_rating"])
-            peak_date = str(df.loc[idx_max, "date_str"])
+        df_with_rating = df.dropna(subset=["player_rating"])
+
+        if not df_with_rating.empty:
+            idx_max = df_with_rating["player_rating"].idxmax()
+            peak_rating = _clean_int(df_with_rating.loc[idx_max, "player_rating"])
+            raw_peak_date = str(df_with_rating.loc[idx_max, "date_str"])
+            if username == "__ALL__":
+                peak_player = str(df_with_rating.loc[idx_max, "player_name"])
+                peak_date = f"{raw_peak_date} ({peak_player})"
+                # Average of each active player's latest rating in the filtered slice
+                latest_per_player = (
+                    df_with_rating.groupby("player_name")["player_rating"].first()
+                )
+                current_rating = _clean_int(latest_per_player.mean())
+            else:
+                peak_date = raw_peak_date
+                if speed.lower() == "all":
+                    # Use the player's most-played speed in the slice so casual side-variants don't distort Current Rating
+                    top_speed_mode = df_with_rating["speed"].mode()
+                    if not top_speed_mode.empty:
+                        primary_speed = top_speed_mode.iloc[0]
+                        primary_ratings = df_with_rating[
+                            df_with_rating["speed"] == primary_speed
+                        ]["player_rating"]
+                        current_rating = _clean_int(primary_ratings.iloc[0])
+                    else:
+                        current_rating = _clean_int(
+                            df_with_rating["player_rating"].iloc[0]
+                        )
+                else:
+                    current_rating = _clean_int(
+                        df_with_rating["player_rating"].iloc[0]
+                    )
 
         summary = {
             **base_stats,
@@ -643,7 +909,7 @@ class LichessWarehouse:
                 )
             speed_breakdown.sort(key=lambda x: x["games"], reverse=True)
 
-        # 2. Termination / Status Breakdown (Overall + Win vs Lose split)
+        # 2. Termination / Status Breakdown
         status_breakdown = []
         if total > 0:
             for status_val, grp in df.groupby("status"):
@@ -673,7 +939,9 @@ class LichessWarehouse:
             time_controls = time_controls[:10]
 
         # 4. Openings Explorer (Overall + White + Black)
-        def _build_openings(sub_df: pd.DataFrame, limit: int = 12) -> List[Dict[str, Any]]:
+        def _build_openings(
+            sub_df: pd.DataFrame, limit: int = 12
+        ) -> List[Dict[str, Any]]:
             if sub_df.empty:
                 return []
             valid = sub_df[sub_df["opening_name"] != "Unknown Opening"]
@@ -738,15 +1006,17 @@ class LichessWarehouse:
                 )
             monthly_trends.sort(key=lambda x: x["month"])
 
-        # 6. Day-of-Week & Hour-of-Day Performance
+        # 6. Vectorized Day-of-Week & Hour-of-Day Performance (PERF-03 fix)
         dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         dow_stats = []
         hour_stats = []
         if total > 0:
+            win_mask = (df["result"] == "win").astype(int)
+            dow_total = df["dow"].value_counts().to_dict()
+            dow_wins = win_mask.groupby(df["dow"]).sum().to_dict()
             for d_idx in range(7):
-                grp = df[df["dow"] == d_idx]
-                cnt = len(grp)
-                w = int((grp["result"] == "win").sum()) if cnt > 0 else 0
+                cnt = int(dow_total.get(d_idx, 0))
+                w = int(dow_wins.get(d_idx, 0))
                 dow_stats.append(
                     {
                         "day": dow_names[d_idx],
@@ -754,10 +1024,12 @@ class LichessWarehouse:
                         "win_rate": round(w * 100.0 / cnt, 1) if cnt > 0 else 0.0,
                     }
                 )
+
+            hour_total = df["hour"].value_counts().to_dict()
+            hour_wins = win_mask.groupby(df["hour"]).sum().to_dict()
             for h_idx in range(24):
-                grp = df[df["hour"] == h_idx]
-                cnt = len(grp)
-                w = int((grp["result"] == "win").sum()) if cnt > 0 else 0
+                cnt = int(hour_total.get(h_idx, 0))
+                w = int(hour_wins.get(h_idx, 0))
                 hour_stats.append(
                     {
                         "hour": f"{h_idx:02d}:00",
@@ -796,47 +1068,12 @@ class LichessWarehouse:
             opponents.sort(key=lambda x: x["games"], reverse=True)
             opponents = opponents[:12]
 
-        # 8. Rating History Time Series (from rating_history_<username>.csv + game fallback)
+        # 8. Rating History Time Series
         rating_history_payload = self._build_rating_history_payload(
             df_ratings, df_raw, date_from=date_from, date_to=date_to
         )
 
-        # 9. Paginated Game Log
-        page = max(1, page)
-        page_size = max(1, min(100, page_size))
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        page_df = df.iloc[start_idx:end_idx]
-
-        games_list = []
-        for _, row in page_df.iterrows():
-            gid = str(row.get("game_id", ""))
-            games_list.append(
-                {
-                    "game_id": gid,
-                    "lichess_url": f"https://lichess.org/{gid}",
-                    "created_at": str(row.get("created_at", ""))[:19],
-                    "speed": str(row.get("speed", "")),
-                    "time_control": str(row.get("time_control", "")),
-                    "rated": bool(row.get("rated", False)),
-                    "source": str(row.get("source", "")),
-                    "player_name": str(row.get("player_name", username)),
-                    "played_as": str(row.get("played_as", "")),
-                    "player_rating": _clean_int(row.get("player_rating"), 0) or None,
-                    "player_rating_diff": _clean_int(row.get("player_rating_diff"), 0),
-                    "opponent_name": str(row.get("opponent_name", "")),
-                    "opponent_rating": _clean_int(row.get("opponent_rating"), 0)
-                    or None,
-                    "result": str(row.get("result", "")),
-                    "status": str(row.get("status", "")),
-                    "opening_eco": str(row.get("opening_eco", "")),
-                    "opening_name": str(row.get("opening_name", "")),
-                    "turns": _clean_int(row.get("turns"), 0) or None,
-                    "move_count": _clean_int(row.get("move_count"), 0) or None,
-                }
-            )
-
-        result_payload = {
+        base_payload = {
             "username": username,
             "empty": False,
             "filters_applied": {
@@ -861,27 +1098,23 @@ class LichessWarehouse:
             },
             "opponents": opponents,
             "rating_history": rating_history_payload,
-            "recent_games": {
-                "page": page,
-                "page_size": page_size,
-                "total_filtered": total,
-                "total_pages": max(1, math.ceil(total / page_size)),
-                "items": games_list,
-            },
+        }
+
+        now_ts = time.time()
+        with self._lock:
+            self._dashboard_cache[slice_cache_key] = (now_ts, base_payload, df)
+            self._dashboard_cache.move_to_end(slice_cache_key)
+            while len(self._dashboard_cache) > 128:
+                self._dashboard_cache.popitem(last=False)
+
+        return {
+            **base_payload,
+            "recent_games": self._paginate_games(df, username, page, page_size),
             "cache_info": {
                 "source": "drive_sync" if force_sync else "warehouse_compute",
-                "cached_at": time.time(),
+                "cached_at": now_ts,
             },
         }
-        with self._lock:
-            if len(self._dashboard_cache) > 128:
-                # Evict oldest entry
-                oldest_key = min(
-                    self._dashboard_cache, key=lambda k: self._dashboard_cache[k][0]
-                )
-                del self._dashboard_cache[oldest_key]
-            self._dashboard_cache[cache_key] = (time.time(), result_payload)
-        return result_payload
 
     def _build_rating_history_payload(
         self,
@@ -898,7 +1131,6 @@ class LichessWarehouse:
                 r_df = r_df[r_df["date_str"] <= date_to]
 
             if not r_df.empty:
-                # Downsample to max ~180 points for smooth canvas rendering while keeping exact start/end
                 step = max(1, len(r_df) // 180)
                 sampled = r_df.iloc[::step].copy()
                 if r_df.index[-1] not in sampled.index:
@@ -932,9 +1164,13 @@ class LichessWarehouse:
                     "latest_by_category": latest_ratings,
                 }
 
-        # Fallback: compute rating history from games DataFrame if rating_history CSV is empty (e.g., __ALL__)
         if df_games.empty:
-            return {"source": "none", "dates": [], "series": {}, "latest_by_category": {}}
+            return {
+                "source": "none",
+                "dates": [],
+                "series": {},
+                "latest_by_category": {},
+            }
 
         g_df = df_games.dropna(subset=["player_rating"]).copy()
         if date_from:
@@ -942,7 +1178,12 @@ class LichessWarehouse:
         if date_to:
             g_df = g_df[g_df["date_str"] <= date_to]
         if g_df.empty:
-            return {"source": "none", "dates": [], "series": {}, "latest_by_category": {}}
+            return {
+                "source": "none",
+                "dates": [],
+                "series": {},
+                "latest_by_category": {},
+            }
 
         piv = (
             g_df.groupby(["month_str", "speed"])["player_rating"]
@@ -983,7 +1224,11 @@ class LichessWarehouse:
         date_to: Optional[str] = None,
         search: Optional[str] = None,
     ) -> str:
-        """Export filtered dataset as CSV (replacing SSIS Flat File / Excel Destination)."""
+        """
+        Export filtered dataset as CSV (replacing SSIS Flat File / Excel Destination),
+        with formula injection neutralization on text columns (SEC-05).
+        """
+        username = self._validate_username(username, allow_all=True)
         df_raw, _ = self.ensure_player_loaded(username, force_sync=False)
         if df_raw.empty:
             return ""
@@ -1042,4 +1287,17 @@ class LichessWarehouse:
             )
             if c in df.columns
         ]
-        return df[export_cols].to_csv(index=False)
+        out_df = df[export_cols].copy()
+        for scol in (
+            "game_id",
+            "player_name",
+            "opponent_name",
+            "opening_eco",
+            "opening_name",
+            "time_control",
+            "status",
+            "source",
+        ):
+            if scol in out_df.columns:
+                out_df[scol] = out_df[scol].map(_sanitize_csv_cell)
+        return out_df.to_csv(index=False)

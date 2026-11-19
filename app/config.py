@@ -48,9 +48,19 @@ TRIGGER_COOLDOWN_SECONDS = int(os.getenv("TRIGGER_COOLDOWN_SECONDS", "120"))
 TRIGGER_MAX_PER_HOUR = int(os.getenv("TRIGGER_MAX_PER_HOUR", "10"))
 
 # ---------------------------------------------------------------------------
-# Multi-Layer Caching TTLs (Reduce Google Drive API calls & recomputation)
+# Multi-Layer Caching TTLs & Memory Bounds (Reduce Drive calls & prevent OOM)
 # ---------------------------------------------------------------------------
 DRIVE_FOLDER_CACHE_TTL = int(os.getenv("DRIVE_FOLDER_CACHE_TTL", "300"))
 PLAYER_SYNC_TTL_SECONDS = int(os.getenv("PLAYER_SYNC_TTL_SECONDS", "600"))
 DASHBOARD_CACHE_TTL_SECONDS = int(os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "300"))
+MAX_CACHED_PLAYERS_IN_MEMORY = int(os.getenv("MAX_CACHED_PLAYERS_IN_MEMORY", "16"))
+
+# Networking & Proxy Configuration
+CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "true").strip().lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
 

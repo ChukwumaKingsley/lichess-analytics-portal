@@ -5,6 +5,7 @@
 const CLIENT_REPORT_TTL_MS = 180 * 1000; // 3 min client memory cache
 const SESSION_LIST_TTL_MS = 180 * 1000;  // 3 min sessionStorage cache for Drive players
 const SESSION_RUNS_TTL_MS = 45 * 1000;   // 45s sessionStorage cache for workflow runs
+const MAX_CLIENT_CACHE_ENTRIES = 64;
 
 const VALID_PAGES = new Set([
   "overview",
@@ -37,6 +38,9 @@ const state = {
   ratingCategoryFilter: "main", // "main" | "all"
   openingSideTab: "overall",    // "overall" | "white" | "black"
   activeRunPollTimer: null,
+  fetchSeq: 0,
+  activeAbortController: null,
+  renderedStamps: {},
   authToken: sessionStorage.getItem("lichess_portal_token") || "",
   authStatus: null,
   charts: {
@@ -140,7 +144,20 @@ function getReportCacheKey(username, filters) {
   return `${String(username || "").toLowerCase()}|${JSON.stringify(filters)}`;
 }
 
+function setClientReportCache(key, data) {
+  if (state.reportCache.has(key)) {
+    state.reportCache.delete(key);
+  }
+  state.reportCache.set(key, { ts: Date.now(), data });
+  while (state.reportCache.size > MAX_CLIENT_CACHE_ENTRIES) {
+    const oldestKey = state.reportCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    state.reportCache.delete(oldestKey);
+  }
+}
+
 function invalidateClientReportCache(username = null) {
+  state.renderedStamps = {};
   if (!username) {
     state.reportCache.clear();
     return;
@@ -435,12 +452,24 @@ async function fetchDashboardData(forceSync = false) {
   } else {
     const hit = state.reportCache.get(cacheKey);
     if (hit && Date.now() - hit.ts < CLIENT_REPORT_TTL_MS) {
+      // Refresh LRU position
+      setClientReportCache(cacheKey, hit.data);
+      if (state.dashboardData !== hit.data) {
+        state.renderedStamps = {};
+      }
       state.dashboardData = hit.data;
       renderHeaderMeta(hit.data, "client_cache");
       renderActivePage();
       return;
     }
   }
+
+  if (state.activeAbortController) {
+    state.activeAbortController.abort();
+  }
+  const controller = new AbortController();
+  state.activeAbortController = controller;
+  const reqSeq = ++state.fetchSeq;
 
   setLoading(
     true,
@@ -464,17 +493,26 @@ async function fetchDashboardData(forceSync = false) {
     if (state.filters.search) params.set("search", state.filters.search);
 
     const res = await apiFetch(
-      `/api/dashboard/${encodeURIComponent(uname)}?${params.toString()}`
+      `/api/dashboard/${encodeURIComponent(uname)}?${params.toString()}`,
+      { signal: controller.signal }
     );
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
       throw new Error(errBody.detail || `HTTP ${res.status}`);
     }
     const data = await res.json();
-    state.dashboardData = data;
-    state.reportCache.set(cacheKey, { ts: Date.now(), data });
 
-    const cacheSource = data.cache_info?.source || (forceSync ? "drive_sync" : "warehouse_compute");
+    // BUG-05 fix: ignore stale out-of-order responses
+    if (reqSeq !== state.fetchSeq || uname !== state.activePlayer) {
+      return;
+    }
+
+    state.dashboardData = data;
+    state.renderedStamps = {};
+    setClientReportCache(cacheKey, data);
+
+    const cacheSource =
+      data.cache_info?.source || (forceSync ? "drive_sync" : "warehouse_compute");
     renderHeaderMeta(data, cacheSource);
     renderActivePage();
 
@@ -484,9 +522,14 @@ async function fetchDashboardData(forceSync = false) {
       refreshCacheTelemetry();
     }
   } catch (err) {
+    if (err && err.name === "AbortError") {
+      return;
+    }
     showToast(`Error loading dashboard: ${err.message}`);
   } finally {
-    setLoading(false);
+    if (reqSeq === state.fetchSeq) {
+      setLoading(false);
+    }
   }
 }
 
@@ -535,6 +578,29 @@ function renderHeaderMeta(data, cacheSource) {
       : "Range: --";
 }
 
+function getPageRenderStamp(page, data) {
+  const base = `${data.username}|${data.cache_info?.cached_at || ""}|${JSON.stringify(
+    data.filters_applied || {}
+  )}`;
+  if (page === "ratings") return `${base}|cat:${state.ratingCategoryFilter}`;
+  if (page === "openings") return `${base}|side:${state.openingSideTab}`;
+  if (page === "games") return `${base}|page:${data.recent_games?.page || 1}`;
+  return base;
+}
+
+function resizePageCharts(page) {
+  const map = {
+    overview: ["overviewRating"],
+    ratings: ["ratingHistory", "monthlyTrends"],
+    timing: ["activityHour", "activityDow", "statusBreakdown"],
+  };
+  (map[page] || []).forEach((k) => {
+    if (state.charts[k]) {
+      state.charts[k].resize();
+    }
+  });
+}
+
 function renderActivePage() {
   const data = state.dashboardData;
   if (!data) return;
@@ -545,7 +611,17 @@ function renderActivePage() {
     return;
   }
 
-  switch (state.activePage) {
+  const page = state.activePage;
+  if (page !== "pipeline") {
+    const stamp = getPageRenderStamp(page, data);
+    if (state.renderedStamps[page] === stamp) {
+      resizePageCharts(page);
+      return;
+    }
+    state.renderedStamps[page] = stamp;
+  }
+
+  switch (page) {
     case "overview":
       renderOverviewPage(data);
       break;
@@ -1631,6 +1707,10 @@ function bindEvents() {
         btn.classList.add("active");
         state.ratingCategoryFilter = btn.dataset.cat;
         if (state.dashboardData) {
+          state.renderedStamps.ratings = getPageRenderStamp(
+            "ratings",
+            state.dashboardData
+          );
           renderRatingHistoryChart(state.dashboardData.rating_history);
         }
       });
@@ -1647,6 +1727,10 @@ function bindEvents() {
         btn.classList.add("active");
         state.openingSideTab = btn.dataset.side;
         if (state.dashboardData) {
+          state.renderedStamps.openings = getPageRenderStamp(
+            "openings",
+            state.dashboardData
+          );
           renderOpeningsPage(state.dashboardData);
         }
       });
@@ -1686,22 +1770,48 @@ function bindEvents() {
       await refreshCacheTelemetry();
     });
 
-  // Export CSV
-  document.getElementById("btn-export-csv")?.addEventListener("click", () => {
-    const params = new URLSearchParams({
-      color: state.filters.color,
-      speed: state.filters.speed,
-      rated: state.filters.rated,
-      source: state.filters.source,
+  // Export CSV via authenticated apiFetch + Blob (SEC-06: never put auth token in URL query string)
+  document
+    .getElementById("btn-export-csv")
+    ?.addEventListener("click", async () => {
+      const params = new URLSearchParams({
+        color: state.filters.color,
+        speed: state.filters.speed,
+        rated: state.filters.rated,
+        source: state.filters.source,
+      });
+      if (state.filters.date_from) params.set("date_from", state.filters.date_from);
+      if (state.filters.date_to) params.set("date_to", state.filters.date_to);
+      if (state.filters.search) params.set("search", state.filters.search);
+
+      try {
+        const res = await apiFetch(
+          `/api/export/${encodeURIComponent(
+            state.activePlayer
+          )}?${params.toString()}`
+        );
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `Export failed (HTTP ${res.status})`);
+        }
+        const blob = await res.blob();
+        const disp = res.headers.get("Content-Disposition") || "";
+        const match = disp.match(/filename="([^"]+)"/);
+        const safeUser =
+          state.activePlayer === "__ALL__" ? "all_players" : state.activePlayer;
+        const filename = match ? match[1] : `lichess_${safeUser}.csv`;
+        const objUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = objUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(objUrl);
+      } catch (err) {
+        showToast(`CSV Export error: ${err.message}`);
+      }
     });
-    if (state.filters.date_from) params.set("date_from", state.filters.date_from);
-    if (state.filters.date_to) params.set("date_to", state.filters.date_to);
-    if (state.filters.search) params.set("search", state.filters.search);
-    if (state.authToken) params.set("token", state.authToken);
-    window.location.href = `/api/export/${encodeURIComponent(
-      state.activePlayer
-    )}?${params.toString()}`;
-  });
 
   // Auth unlock handlers
   document
